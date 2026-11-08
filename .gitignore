@@ -1,0 +1,10 @@
+node_modules/
+.gerry/
+coverage/
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store
+*.swp
+*.swo

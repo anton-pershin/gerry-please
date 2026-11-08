@@ -1,0 +1,155 @@
+server:
+  host: 127.0.0.1
+  port: 3789
+  data_dir: .gerry
+  workers: 2
+  max_body_bytes: 10485760
+
+github:
+  app_id_env: GITHUB_APP_ID
+  private_key_path_env: GITHUB_APP_PRIVATE_KEY_PATH
+  webhook_secret_env: GITHUB_WEBHOOK_SECRET
+
+repositories:
+  your-org/your-repo:
+    path: /absolute/path/to/your-repo
+    default_branch: main
+  your-org/dependency-repo:
+    path: /absolute/path/to/dependency-repo
+    default_branch: main
+
+runtimes:
+  opencode-local:
+    type: opencode
+    # Omit base_url to discover/start the local OpenCode V2 service.
+    # base_url: http://127.0.0.1:4096
+    # token_env: OPENCODE_TOKEN
+  hermes-local:
+    type: hermes
+    command: hermes
+
+agents:
+  maintainer:
+    runtime: opencode-local
+    instructions: examples/agents/maintainer.md
+    workspace: shared
+    timeout_seconds: 900
+    max_attempts: 3
+    retry_backoff_seconds: 30
+    options:
+      agent: build
+      # model: anthropic/claude-sonnet-5-5#high
+      permissions:
+        - { action: edit, resource: "*", effect: deny }
+        - { action: shell, resource: "git push *", effect: deny }
+        - { action: read, resource: "*.env*", effect: deny }
+
+  reviewer:
+    runtime: hermes-local
+    instructions: examples/agents/reviewer.md
+    workspace: shared
+    timeout_seconds: 900
+    options:
+      profile: reviewer
+      # provider: openrouter
+      # model: anthropic/claude-sonnet-4.6
+      toolsets: [terminal, web]
+      max_turns: 30
+
+  implementer:
+    runtime: hermes-local
+    instructions: examples/agents/implementer.md
+    workspace: worktree
+    timeout_seconds: 3600
+    max_attempts: 3
+    retry_backoff_seconds: 60
+    options:
+      profile: implementer
+      toolsets: [terminal, web, skills]
+      # skills: [github-auth]
+      max_turns: 100
+
+dependencies:
+  - from: your-org/your-repo
+    to: your-org/dependency-repo
+    allow_issue_creation: true
+    resume:
+      agent: implementer
+      prompt: examples/prompts/resume-after-dependency.md
+      workflow: implementation
+      max_turns: 20
+
+rules:
+  - name: triage-new-issue
+    on: { event: issues, actions: [opened] }
+    agent: maintainer
+    prompt: examples/prompts/triage.md
+    once_per_subject: true
+
+  - name: implement-approved-issue
+    on: { event: issues, actions: [labeled] }
+    when:
+      - path: label.name
+        equals: approved
+    agent: implementer
+    prompt: examples/prompts/implement.md
+    session: workflow
+    workflow: implementation
+    workflow_start: true
+    max_turns: 20
+    once_per_subject: true
+
+  # Review rounds resume the same implementer session/worktree via the PR head branch.
+  - name: address-inline-pr-review
+    on: { event: pull_request_review_comment, actions: [created] }
+    when:
+      - path: comment.body
+        contains: "@implementer"
+        ignore_case: true
+    agent: implementer
+    prompt: examples/prompts/address-review.md
+    session: workflow
+    workflow: implementation
+    max_turns: 20
+
+  - name: address-general-pr-review
+    on: { event: pull_request_review, actions: [submitted] }
+    when:
+      - path: review.state
+        in: [commented, changes_requested]
+      - path: review.body
+        contains: "@implementer"
+        ignore_case: true
+    agent: implementer
+    prompt: examples/prompts/address-review.md
+    session: workflow
+    workflow: implementation
+    max_turns: 20
+
+  # An approving review completes the workflow internally; no agent rule is needed.
+
+  # These two rules share one conversation budget but separate runtime sessions.
+  # Agents hand off by mentioning @maintainer or @reviewer in a GitHub comment.
+  - name: maintainer-discussion
+    on: { event: issue_comment, actions: [created] }
+    when:
+      - path: comment.body
+        contains: "@maintainer"
+        ignore_case: true
+    agent: maintainer
+    prompt: examples/prompts/maintainer-discussion.md
+    session: conversation
+    conversation: issue-discussion
+    max_turns: 8
+
+  - name: reviewer-discussion
+    on: { event: issue_comment, actions: [created] }
+    when:
+      - path: comment.body
+        contains: "@reviewer"
+        ignore_case: true
+    agent: reviewer
+    prompt: examples/prompts/reviewer-discussion.md
+    session: conversation
+    conversation: issue-discussion
+    max_turns: 8
