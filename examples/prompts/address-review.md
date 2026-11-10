@@ -1,4 +1,4 @@
-Address the latest review on PR #{{pull_request.number}} in workflow {{workflow.id}}.
+Address the latest review on PR #{{pull_request.number}}.
 
 Inline review comment:
 
@@ -8,6 +8,6 @@ General review feedback:
 
 {{review.body}}
 
-Read the full review discussion and current PR diff. Resume the existing implementation work rather than starting a new design or PR. Address every actionable concern, update the specification and tests when necessary, run relevant checks, commit and push to the existing branch, and reply to the reviewer with specific outcomes and verification results.
+Read the full review discussion and current PR diff. Resume the existing implementation work rather than starting a new design or PR. Address every no-pass point. You should also address the maintenance risks if you agree with them.
 
-Do not create another PR or switch branches. If the feedback is unclear or conflicts with approved requirements, explain the concern and request clarification instead of making an arbitrary change.
+If the feedback is unclear or conflicts with approved requirements, explain the concern and request clarification instead of making an arbitrary change.

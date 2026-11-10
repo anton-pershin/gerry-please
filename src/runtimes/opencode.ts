@@ -1,9 +1,9 @@
-import { OpenCode, type OpenCodeClient, type OpenCodeEvent } from "@opencode/client";
+import { ClientError, OpenCode, type OpenCodeClient, type OpenCodeEvent } from "@opencode/client";
 import { Service } from "@opencode/client/service";
 import { z } from "zod";
 import type { RuntimeConfig } from "../config.ts";
 import type { AgentRuntime, RuntimeFactoryContext, RuntimeResult, RuntimeRunInput, Usage } from "../types.ts";
-import { compactError, parseModel, withDeadline } from "../util.ts";
+import { compactError, parseModel, sleep, withDeadline } from "../util.ts";
 import { RuntimeExecutionError } from "./types.ts";
 
 const optionsSchema = z
@@ -42,6 +42,34 @@ function responseFromMessages(response: Awaited<ReturnType<OpenCodeClient["messa
   const latest = assistants[0];
   if (!latest || latest.type !== "assistant") return "";
   return latest.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+}
+
+function isTransportTimeout(error: unknown): boolean {
+  return error instanceof ClientError && error.reason === "Transport" && error.cause instanceof Error &&
+    (error.cause.name === "TimeoutError" || error.cause.message.includes("The operation timed out"));
+}
+
+export async function waitForOpenCodeSession(input: {
+  client: OpenCodeClient;
+  sessionID: string;
+  timeoutMs: number;
+  signal: AbortSignal;
+  emit?: (event: { type: string; data: unknown }) => void;
+}): Promise<void> {
+  const maximumAttempts = Math.max(2, Math.ceil(input.timeoutMs / 300_000));
+  for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
+    try {
+      await input.client.experimental.session.wait({ sessionID: input.sessionID }, { signal: input.signal });
+      return;
+    } catch (error) {
+      if (!isTransportTimeout(error) || input.signal.aborted || attempt === maximumAttempts) throw error;
+      input.emit?.({
+        type: "opencode.wait.reconnecting",
+        data: { nextAttempt: attempt + 1, maximumAttempts, error: compactError(error) },
+      });
+      await sleep(250, input.signal);
+    }
+  }
 }
 
 export class OpenCodeRuntime implements AgentRuntime {
@@ -157,7 +185,13 @@ export class OpenCodeRuntime implements AgentRuntime {
       })();
       await withDeadline(ready, 10_000, "OpenCode event stream did not become ready");
       await this.client.session.prompt({ sessionID: sessionId, text: input.prompt }, { signal });
-      await this.client.experimental.session.wait({ sessionID: sessionId }, { signal });
+      await waitForOpenCodeSession({
+        client: this.client,
+        sessionID: sessionId,
+        timeoutMs: input.timeoutMs,
+        signal,
+        emit: input.emit,
+      });
       executionIdle = true;
       const session = await this.client.session.get({ sessionID: sessionId }, { signal });
       usage = {
