@@ -163,6 +163,38 @@ describe("durable store", () => {
     fixture.store.close();
   });
 
+  test("keeps later conversation turns behind an earlier retry-waiting turn", () => {
+    const fixture = setup();
+    const rule: RuleConfig = {
+      ...fixture.config.rules[0]!,
+      session: "conversation",
+      conversation: "ordered-retries",
+      once_per_subject: false,
+    };
+    const first = enqueue(fixture.store, fixture, context(), rule);
+    const second = enqueue(fixture.store, fixture, issueWithDelivery("delivery-2"), rule);
+    const claimed = fixture.store.claimNext("worker-1")!;
+    expect(claimed.id).toBe(first.runId!);
+    fixture.store.fail(claimed.id, "worker-1", "provider quota exhausted", {
+      retryable: true,
+      retryDelayMs: 300_000,
+      ignoreAttemptLimit: true,
+      preserveLedger: true,
+    });
+
+    expect(fixture.store.claimNext("worker-2")).toBeNull();
+    fixture.store.db.query("UPDATE runs SET available_at = ? WHERE id = ?").run(Date.now() - 1, first.runId!);
+    const retried = fixture.store.claimNext("worker-2")!;
+    expect(retried.id).toBe(first.runId!);
+    fixture.store.succeed(retried.id, "worker-2", {
+      runtimeSessionId: "session-1",
+      responsePath: "/tmp/response.md",
+      usage: null,
+    });
+    expect(fixture.store.claimNext("worker-3")?.id).toBe(second.runId!);
+    fixture.store.close();
+  });
+
   test("retries preparation failures with backoff and cancels queued runs", () => {
     const fixture = setup();
     enqueue(fixture.store, fixture, context());

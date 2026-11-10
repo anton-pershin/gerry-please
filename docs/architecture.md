@@ -34,12 +34,13 @@ After the instance lock is acquired, active runs from the previous process becom
 
 ## Retry semantics
 
-There are two failure classes:
+There are three failure classes:
 
 - **Before runtime startup**: workspace, prompt, configuration, or token acquisition failed. Retry automatically with exponential backoff up to `max_attempts`.
-- **After runtime startup**: the agent may have commented, edited, pushed, or opened a PR. Do not automatically replay. Mark `failed` or `interrupted`, retain artifacts/session/worktree/rule ledger, quarantine any conversation, and require `runs retry` or `runs resolve` after reconciliation.
+- **Definite provider quota exhaustion**: the runtime returned a structured quota error rather than an ambiguous transport failure. Requeue the same run in `retry_wait`, starting after five minutes and doubling the delay on each quota failure up to one hour. These retries do not use the `max_attempts` preparation budget. Preserve the runtime session, worktree, rule ledger, and active workflow/conversation without quarantine. The wait is durable across daemon restarts, consumes no worker, and can be cancelled. Later turns in the same conversation or workflow cannot overtake the waiting turn. OpenCode currently supplies this classification for `provider.quota` errors.
+- **Other failures after runtime startup**: the agent may have commented, edited, pushed, or opened a PR. Do not automatically replay. Mark `failed` or `interrupted`, retain artifacts/session/worktree/rule ledger, quarantine any conversation or workflow, and require `runs retry` or `runs resolve` after reconciliation.
 
-An operator retry is a deliberate new attempt, not proof that previous side effects did not happen. Check the issue, PR, branch, and response/events first.
+An operator retry is a deliberate new attempt, not proof that previous side effects did not happen. Check the issue, PR, branch, and response/events first. A provider-quota retry is different: it resumes the same recorded session after a definite provider response instead of starting a replacement workflow.
 
 ## Persistent discussions
 

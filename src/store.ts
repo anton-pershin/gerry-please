@@ -687,6 +687,15 @@ export class Store {
                   WHERE active.conversation_key = candidate.conversation_key
                     AND active.id != candidate.id AND active.status IN ('preparing', 'running')
                 )
+                AND NOT EXISTS (
+                  SELECT 1 FROM runs AS earlier_retry
+                  WHERE earlier_retry.conversation_key = candidate.conversation_key
+                    AND earlier_retry.status = 'retry_wait'
+                    AND (
+                      earlier_retry.created_at < candidate.created_at
+                      OR (earlier_retry.created_at = candidate.created_at AND earlier_retry.rowid < candidate.rowid)
+                    )
+                )
               )
             )
             AND (
@@ -702,9 +711,18 @@ export class Store {
                     AND active_workflow_run.id != candidate.id
                     AND active_workflow_run.status IN ('preparing', 'running')
                 )
+                AND NOT EXISTS (
+                  SELECT 1 FROM runs AS earlier_workflow_retry
+                  WHERE earlier_workflow_retry.workflow_id = candidate.workflow_id
+                    AND earlier_workflow_retry.status = 'retry_wait'
+                    AND (
+                      earlier_workflow_retry.created_at < candidate.created_at
+                      OR (earlier_workflow_retry.created_at = candidate.created_at AND earlier_workflow_retry.rowid < candidate.rowid)
+                    )
+                )
               )
             )
-          ORDER BY candidate.created_at LIMIT 1`)
+          ORDER BY candidate.created_at, candidate.rowid LIMIT 1`)
         .get(now()) as RunRow | null;
       if (!candidate) return null;
       const timestamp = now();
@@ -877,13 +895,21 @@ export class Store {
     runId: string,
     workerId: string,
     error: string,
-    options: { retryable: boolean; interrupted?: boolean; preserveLedger?: boolean },
+    options: {
+      retryable: boolean;
+      interrupted?: boolean;
+      preserveLedger?: boolean;
+      retryDelayMs?: number;
+      ignoreAttemptLimit?: boolean;
+    },
   ): RunRecord {
     return this.db.transaction(() => {
       const run = this.getRun(runId);
-      const retry = !options.interrupted && options.retryable && run.attempt < run.maxAttempts;
+      const withinAttemptLimit = options.ignoreAttemptLimit || run.attempt < run.maxAttempts;
+      const retry = !options.interrupted && options.retryable && withinAttemptLimit;
       const status: RunStatus = options.interrupted ? "interrupted" : retry ? "retry_wait" : "failed";
-      const availableAt = retry ? now() + run.retryBackoffSeconds * 1000 * 2 ** Math.max(0, run.attempt - 1) : run.availableAt;
+      const defaultDelayMs = run.retryBackoffSeconds * 1000 * 2 ** Math.max(0, run.attempt - 1);
+      const availableAt = retry ? now() + (options.retryDelayMs ?? defaultDelayMs) : run.availableAt;
       const update = this.db
         .query(`UPDATE runs SET status = ?, available_at = ?, lease_owner = NULL, lease_expires_at = NULL,
           agent_capability_hash = NULL, finished_at = ?, last_error = ? WHERE id = ? AND lease_owner = ?`)

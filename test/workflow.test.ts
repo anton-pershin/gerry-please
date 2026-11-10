@@ -61,6 +61,38 @@ describe("workflow-scoped execution", () => {
     store.close();
   });
 
+  test("keeps a workflow active and ordered while an earlier turn waits for quota", () => {
+    const fixture = workflowConfigFixture();
+    directories.push(fixture.directory);
+    const store = new Store(fixture.config.dataDir);
+    const start = enqueueWorkflow(store, fixture, issueContext(), "implement-approved-issue");
+    const startRun = store.getRun(start.runId!);
+    const workflow = store.getWorkflow(startRun.workflowId!);
+    const reviewContext = prContext({ number: 100, branch: workflow.branch!, deliveryId: "review" });
+    store.linkWorkflowPullRequest(reviewContext);
+    const review = enqueueWorkflow(store, fixture, reviewContext, "address-pr-review");
+    const claimed = store.claimNext("worker-1")!;
+    expect(claimed.id).toBe(start.runId!);
+    store.fail(claimed.id, "worker-1", "provider quota exhausted", {
+      retryable: true,
+      retryDelayMs: 300_000,
+      ignoreAttemptLimit: true,
+      preserveLedger: true,
+    });
+
+    expect(store.getWorkflow(workflow.id).quarantined).toBe(false);
+    expect(store.claimNext("worker-2")).toBeNull();
+    store.db.query("UPDATE runs SET available_at = ? WHERE id = ?").run(Date.now() - 1, start.runId!);
+    expect(store.claimNext("worker-2")?.id).toBe(start.runId!);
+    store.succeed(start.runId!, "worker-2", {
+      runtimeSessionId: "session-1",
+      responsePath: "/tmp/response.md",
+      usage: null,
+    });
+    expect(store.claimNext("worker-3")?.id).toBe(review.runId!);
+    store.close();
+  });
+
   test("rejects forked, wrong-repository, and replacement PR identities", () => {
     const fixture = workflowConfigFixture();
     directories.push(fixture.directory);

@@ -3,7 +3,7 @@ import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { readPrompt, type RuleConfig } from "../src/config.ts";
 import { Logger } from "../src/observability.ts";
-import { RuntimeExecutionError } from "../src/runtimes/types.ts";
+import { ProviderQuotaError, RuntimeExecutionError } from "../src/runtimes/types.ts";
 import { Store } from "../src/store.ts";
 import type { AgentRuntime, RuntimeRunInput } from "../src/types.ts";
 import { WorkerPool } from "../src/worker.ts";
@@ -137,6 +137,41 @@ describe("worker execution", () => {
     const failed = fixture.store.getRun(decision.runId!);
     expect(failed.status).toBe("failed");
     expect(failed.runtimeSessionId).toBe("partial-session");
+    fixture.store.close();
+  });
+
+  test("waits for provider quota without exhausting attempts or losing the session", async () => {
+    let attempts = 0;
+    const fixture = setup(async () => {
+      attempts += 1;
+      if (attempts <= 4) {
+        throw new ProviderQuotaError("5-hour quota exhausted; provider text mentions timed out and abort", { sessionId: "partial-session" });
+      }
+      return { sessionId: "partial-session", response: "recovered" };
+    });
+    const decision = enqueue(fixture, fixture.store);
+    const expectedDelays = [300_000, 600_000, 1_200_000, 2_400_000];
+
+    for (let attempt = 1; attempt <= 4; attempt += 1) {
+      const before = Date.now();
+      await fixture.workers.runNext("worker-test");
+      const waiting = fixture.store.getRun(decision.runId!);
+      expect(waiting.status).toBe("retry_wait");
+      expect(waiting.attempt).toBe(attempt);
+      expect(waiting.maxAttempts).toBe(3);
+      expect(waiting.runtimeSessionId).toBe("partial-session");
+      expect(waiting.availableAt - before).toBeGreaterThanOrEqual(expectedDelays[attempt - 1]!);
+      expect(waiting.availableAt - before).toBeLessThan(expectedDelays[attempt - 1]! + 1000);
+      fixture.store.db.query("UPDATE runs SET available_at = ? WHERE id = ?").run(Date.now() - 1, waiting.id);
+    }
+
+    await fixture.workers.runNext("worker-test");
+    expect(fixture.store.getRun(decision.runId!).status).toBe("succeeded");
+    expect(fixture.runtime.inputs).toHaveLength(5);
+    expect(fixture.runtime.inputs[0]!.existingSessionId).toBeNull();
+    for (const input of fixture.runtime.inputs.slice(1)) {
+      expect(input.existingSessionId).toBe("partial-session");
+    }
     fixture.store.close();
   });
 
