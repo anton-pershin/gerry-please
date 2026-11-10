@@ -2,7 +2,9 @@ node_modules/
 gerry.yaml
 gerry.test.yaml
 gerry.stage1.yaml
+gerry.stage2.yaml
 .gerry/
+.gerry-stage2/
 .gerry-stage1/
 .gerry-test/
 .gerry-simple/
