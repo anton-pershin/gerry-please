@@ -10,6 +10,7 @@ function fakeClient(sessionID = "opencode-session") {
   const environmentCalls: Array<Record<string, string>> = [];
   const permissionReplies: Array<Record<string, unknown>> = [];
   const prompts: string[] = [];
+  const messageListInputs: Array<{ limit?: number }> = [];
   const session = {
     id: sessionID,
     projectID: "project",
@@ -42,7 +43,9 @@ function fakeClient(sessionID = "opencode-session") {
       reply: async (input: Record<string, unknown>) => { permissionReplies.push(input); },
     },
     message: {
-      list: async () => ({
+      list: async (input: { limit?: number }) => {
+        messageListInputs.push(input);
+        return {
         data: [{
           id: "message-1",
           type: "assistant",
@@ -51,11 +54,12 @@ function fakeClient(sessionID = "opencode-session") {
           time: { created: Date.now() },
           content: [{ type: "text", text: "Hello world" }],
         }],
-        cursor: {},
-      }),
+          cursor: {},
+        };
+      },
     },
   };
-  return { client: client as unknown as OpenCodeClient, environmentCalls, permissionReplies, prompts };
+  return { client: client as unknown as OpenCodeClient, environmentCalls, permissionReplies, prompts, messageListInputs };
 }
 
 describe("OpenCode client adapter", () => {
@@ -87,6 +91,7 @@ describe("OpenCode client adapter", () => {
       expect(result.response).toBe("Hello world");
       expect(result.usage?.costUsd).toBe(0.25);
       expect(fake.prompts).toEqual(["Review the issue"]);
+      expect(fake.messageListInputs[0]?.limit).toBe(200);
       expect(fake.permissionReplies[0]).toMatchObject({ requestID: "permission-1", decision: "reject" });
       expect(fake.environmentCalls[0]?.GH_TOKEN).toBe("secret");
       expect(fake.environmentCalls.at(-1)?.GH_TOKEN).toBeUndefined();

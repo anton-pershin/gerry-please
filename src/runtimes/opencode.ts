@@ -169,7 +169,7 @@ export class OpenCodeRuntime implements AgentRuntime {
         costUsd: session.cost,
         sessionTotals: true,
       };
-      const messages = await this.client.message.list({ sessionID: sessionId, limit: 1000, order: "desc" }, { signal });
+      const messages = await this.client.message.list({ sessionID: sessionId, limit: 200, order: "desc" }, { signal });
       input.emit({ type: "opencode.snapshot.messages", data: messages });
       input.emit({ type: "opencode.snapshot.session", data: session });
       if (executionError || session.outcome === "failed") {
