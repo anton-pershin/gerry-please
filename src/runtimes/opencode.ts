@@ -4,7 +4,7 @@ import { z } from "zod";
 import type { RuntimeConfig } from "../config.ts";
 import type { AgentRuntime, RuntimeFactoryContext, RuntimeResult, RuntimeRunInput, Usage } from "../types.ts";
 import { compactError, parseModel, sleep, withDeadline } from "../util.ts";
-import { RuntimeExecutionError } from "./types.ts";
+import { ProviderQuotaError, RuntimeExecutionError } from "./types.ts";
 
 const optionsSchema = z
   .object({
@@ -44,9 +44,25 @@ function responseFromMessages(response: Awaited<ReturnType<OpenCodeClient["messa
   return latest.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
 }
 
+function latestErrorFromMessages(
+  response: Awaited<ReturnType<OpenCodeClient["message"]["list"]>>,
+  previousMessageId: string | null,
+): unknown {
+  for (const message of response.data) {
+    if (message.id === previousMessageId) break;
+    if ("error" in message && message.error) return message.error;
+  }
+  return undefined;
+}
+
 function isTransportTimeout(error: unknown): boolean {
   return error instanceof ClientError && error.reason === "Transport" && error.cause instanceof Error &&
     (error.cause.name === "TimeoutError" || error.cause.message.includes("The operation timed out"));
+}
+
+export function isOpenCodeProviderQuotaError(error: unknown): boolean {
+  return error !== null && typeof error === "object" &&
+    (error as { type?: unknown }).type === "provider.quota";
 }
 
 export async function waitForOpenCodeSession(input: {
@@ -118,10 +134,16 @@ export class OpenCodeRuntime implements AgentRuntime {
     let usage: Usage | undefined;
     let executionIdle = false;
     let eventPump: Promise<void> | undefined;
+    let previousMessageId: string | null = null;
 
     try {
       if (sessionId) {
         await this.client.session.get({ sessionID: sessionId }, { signal });
+        const previousMessages = await this.client.message.list(
+          { sessionID: sessionId, limit: 1, order: "desc" },
+          { signal },
+        );
+        previousMessageId = previousMessages.data[0]?.id ?? null;
       } else {
         const session = await this.client.session.create(
           {
@@ -206,8 +228,11 @@ export class OpenCodeRuntime implements AgentRuntime {
       const messages = await this.client.message.list({ sessionID: sessionId, limit: 200, order: "desc" }, { signal });
       input.emit({ type: "opencode.snapshot.messages", data: messages });
       input.emit({ type: "opencode.snapshot.session", data: session });
-      if (executionError || session.outcome === "failed") {
-        throw new RuntimeExecutionError(`OpenCode execution failed: ${JSON.stringify(executionError ?? "See runtime events")}`, {
+      const failure = executionError ??
+        (session.outcome === "failed" ? latestErrorFromMessages(messages, previousMessageId) : undefined);
+      if (failure || session.outcome === "failed") {
+        const ErrorClass = isOpenCodeProviderQuotaError(failure) ? ProviderQuotaError : RuntimeExecutionError;
+        throw new ErrorClass(`OpenCode execution failed: ${JSON.stringify(failure ?? "See runtime events")}`, {
           sessionId,
           response: streamedText,
           usage,

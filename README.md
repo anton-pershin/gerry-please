@@ -17,7 +17,7 @@ There is no GUI. YAML configures the system, SQLite makes execution durable, and
 - Gives coding agents dedicated Git worktrees and branches; preserves them after failure for inspection.
 - Uses short-lived GitHub App installation tokens for `gh` and Git operations.
 - Records run lineage, configuration/prompt hashes, runtime sessions, events, responses, errors, and usage.
-- Automatically retries failures **before** runtime startup. Runtime failures require explicit operator retry because GitHub side effects may already have occurred.
+- Automatically retries failures **before** runtime startup and definite provider-quota exhaustion with durable, capped exponential backoff. Other runtime failures require explicit operator retry because GitHub side effects may already have occurred.
 
 ## Architecture
 

@@ -5,7 +5,7 @@ import type { LoadedConfig } from "./config.ts";
 import { buildAgentEnvironment, gitCredentialEnvironment } from "./github.ts";
 import { AttemptRecorder, Logger, Redactor, atomicWrite, writeRunSummary } from "./observability.ts";
 import { buildContext, renderTemplate, templateRoot } from "./rules.ts";
-import { RuntimeExecutionError } from "./runtimes/types.ts";
+import { ProviderQuotaError, RuntimeExecutionError } from "./runtimes/types.ts";
 import type { Store } from "./store.ts";
 import type { AgentRuntime, JsonObject, RunRecord, WebhookContext } from "./types.ts";
 import { compactError, errorMessage, id, sleep, stableStringify, withDeadline } from "./util.ts";
@@ -22,6 +22,14 @@ export interface WorkerPoolOptions {
   tokens: TokenProvider;
   logger: Logger;
   workspace?: WorkspaceManager;
+}
+
+const QUOTA_INITIAL_RETRY_DELAY_MS = 5 * 60 * 1000;
+const QUOTA_MAX_RETRY_DELAY_MS = 60 * 60 * 1000;
+
+function quotaRetryDelayMs(attempt: number): number {
+  const exponent = Math.min(4, Math.max(0, attempt - 1));
+  return Math.min(QUOTA_MAX_RETRY_DELAY_MS, QUOTA_INITIAL_RETRY_DELAY_MS * 2 ** exponent);
 }
 
 function buildPrompt(input: {
@@ -44,6 +52,7 @@ function buildPrompt(input: {
     `${input.run.workflowId ? `- Workflow: \`${input.run.workflowType}\` / \`${input.run.workflowId}\`\n` : ""}` +
     `- Complete webhook context: \`${input.contextPath}\`\n\n` +
     `Work only inside the assigned workspace. Use \`gh\` with the provided GH_TOKEN for GitHub operations. ` +
+    `Do not use \`gh auth token\` or override GH_TOKEN with personal or stored credentials. ` +
     `Never print or persist credentials. Do not read or modify Gerry's own configuration, database, or data directory. ` +
     `When writing a GitHub issue comment, PR comment, or review, append the hidden lineage marker ` +
     `\`<!-- gerry:run=${input.run.id} -->\` on its own line. ` +
@@ -239,9 +248,12 @@ export class WorkerPool {
         atomicWrite(responsePath, new Redactor([token, capability]).text(error.details.response));
       }
       const safeError = new Redactor([token, capability]).text(errorMessage(error));
-      const interrupted = this.shutdownController.signal.aborted || /timed out|abort/i.test(compactError(error));
+      const quotaFailure = error instanceof ProviderQuotaError;
+      const interrupted = this.shutdownController.signal.aborted ||
+        (!quotaFailure && /timed out|abort/i.test(compactError(error)));
       const updated = store.fail(run.id, workerId, safeError, {
-        retryable: !runtimeStarted,
+        retryable: !runtimeStarted || quotaFailure,
+        ...(quotaFailure ? { retryDelayMs: quotaRetryDelayMs(run.attempt), ignoreAttemptLimit: true } : {}),
         interrupted,
         preserveLedger: runtimeStarted,
       });
@@ -249,7 +261,9 @@ export class WorkerPool {
         runId: run.id,
         attempt: run.attempt,
         status: updated.status,
-        retryable: !runtimeStarted && updated.status === "retry_wait",
+        retryable: updated.status === "retry_wait",
+        ...(quotaFailure ? { retryReason: "provider_quota" } : {}),
+        ...(updated.status === "retry_wait" ? { nextAttemptAt: new Date(updated.availableAt).toISOString() } : {}),
         error: safeError,
       });
     } finally {

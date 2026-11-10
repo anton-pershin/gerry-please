@@ -68,7 +68,7 @@ Common fields:
 | `instructions` | none | Markdown file prepended to every task |
 | `workspace` | `shared` | `shared` or `worktree` |
 | `timeout_seconds` | `1800` | Runtime attempt timeout |
-| `max_attempts` | `3` | Automatic preparation-attempt budget |
+| `max_attempts` | `3` | Automatic preparation-attempt budget; provider-quota waits are not bounded by it |
 | `retry_backoff_seconds` | `30` | Initial exponential backoff |
 | `pass_environment` | `[]` | Additional process environment names forwarded to the runtime |
 | `env` | `{}` | Literal additional environment values; do not use for secrets |

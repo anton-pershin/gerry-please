@@ -16,7 +16,7 @@ Open a run’s `summary.md`, then inspect `attempts/<n>/events.jsonl` and `respo
 
 ## Before any manual retry
 
-A runtime failure is ambiguous. Check:
+Except for definite provider-quota failures handled below, a runtime failure is ambiguous. Check:
 
 1. `summary.md` and the failed attempt’s events;
 2. issue/PR comments, labels, reviews, and checks;
@@ -74,7 +74,9 @@ The delivery/rule dispatch is `skipped` with a turn-limit reason. Read the discu
 
 ## Token or runtime outages
 
-Pre-runtime failures enter `retry_wait` with exponential backoff. Check `doctor` and service logs. Runtime-start failures do not auto-replay, even when they look transient, because the exact point of failure is not a safe transaction boundary.
+Pre-runtime failures enter `retry_wait` with exponential backoff. Check `doctor` and service logs. Other runtime-start failures do not auto-replay, even when they look transient, because the exact point of failure is not a safe transaction boundary.
+
+A structured provider-quota error also enters `retry_wait`, but preserves the active workflow and retries indefinitely: after five minutes initially, then with delays doubled up to one hour. The provider response does not necessarily include a reset timestamp, so these attempts are periodic probes rather than a claim about the exact reset time. `runs show` displays `availableAt`, and `summary.md` displays the next attempt time. The same run, session, worktree, and branch resume when an attempt is due. Restarting Gerry does not cancel the wait, and an idle retry wait consumes no worker. Use `runs cancel` if waiting is no longer desired; use `runs retry` once for a quota run that already reached `failed` under an older Gerry version.
 
 ## Worktree cleanup
 

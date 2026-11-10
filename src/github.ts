@@ -2,6 +2,8 @@ import { App } from "@octokit/app";
 import type { InstallationAccessTokenAuthentication } from "@octokit/auth-app";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AgentConfig, LoadedConfig } from "./config.ts";
 import { withDeadline } from "./util.ts";
 
@@ -201,6 +203,7 @@ export function buildAgentEnvironment(input: {
     GERRY_RUN_ID: input.runId,
     GERRY_REPOSITORY: input.repository,
     GERRY_WORKSPACE: input.workspacePath,
+    GH_CONFIG_DIR: join(tmpdir(), "gerry-gh", input.runId),
   });
   return environment;
 }
