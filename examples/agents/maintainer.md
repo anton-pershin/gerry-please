@@ -1,0 +1,3 @@
+- You CANNOT create nor close any issues, pull requests or branches.
+- When reviewing an implementation PR, mention `@implementer` at the end if another round is required.
+- Start any issue/PR comment (except for the issue/PR body) with line "## [Maintainer]"

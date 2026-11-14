@@ -12,7 +12,7 @@ bun run src/cli.ts runs list --status interrupted
 tail -f .gerry/logs/service.jsonl | jq .
 ```
 
-Open a run’s `summary.md`, then inspect `attempts/<n>/events.jsonl` and `response.md`. Use `deliveries show <id>` to see whether no rule matched, a turn budget stopped dispatch, a once-per-subject ledger already existed, or a run was queued. Use `workflows show <workflow-id>` to inspect PR linkage, active/waiting/completed state, quarantine, and all dependencies.
+Open a run’s `summary.md`, then inspect `attempts/<n>/events.jsonl` and `response.md`. Use `deliveries show <id>` to see whether no rule matched, a turn budget stopped dispatch, a once-per-subject ledger already existed, or a run was queued. Use `workflows show <workflow-id>` to inspect PR linkage, active/waiting/closed/completed state, quarantine, and all dependencies. Approval leaves a workflow active; only a merged PR completes it.
 
 ## Before any manual retry
 
@@ -32,6 +32,7 @@ If the previous attempt already opened a PR, prefer a new rule/event for follow-
 bun run src/cli.ts runs retry run_...
 bun run src/cli.ts runs cancel run_...
 bun run src/cli.ts runs resolve run_...
+bun run src/cli.ts workflows abandon wf_...
 ```
 
 Retry is available for `failed`, `interrupted`, and `cancelled` runs. It adds one attempt to the budget and queues the same run ID. Cancellation only applies before runtime execution (`queued`/`retry_wait`); it does not kill an active runtime.
@@ -39,6 +40,8 @@ Retry is available for `failed`, `interrupted`, and `cancelled` runs. It adds on
 Resolve is available once for a `failed`/`interrupted` run after you have reconciled external effects. It does **not** execute the agent or change the historical failure state. It records `resolvedAt`, releases once-per-subject ownership, and clears quarantine owned by that run so later work can proceed. Resolved runs cannot subsequently be retried, and resolving an older run cannot clear a newer run’s quarantine. Never use resolve merely to bypass an unread failure.
 
 Once-per-subject ownership is restored on retry unless another run has since acquired it. Conversation retry clears quarantine and reuses the recorded compatible session/workspace. Explicit same-run retries also resume recorded partial sessions for originally fresh runs. Failed turns continue to count toward the discussion budget; an operator retry is an explicit exception to automatic dispatch, not a budget reset.
+
+`workflows abandon` is only for a closed-unmerged workflow with no active run. It preserves the old workflow, runs, sessions, worktree, branch, and PR linkage, but releases its once-per-subject implementation ledgers. A later approval creates a replacement workflow with a new ID, session, worktree, and branch. Abandoned workflows cannot execute runs and do not block replacement creation.
 
 ## Process crash
 
@@ -52,11 +55,17 @@ Incomplete `received`/`dispatch_failed` deliveries are redispatched idempotently
 
 Prompt/instruction contents are snapshotted at dispatch, so later file edits do not change an existing queued run. Treat them as production configuration anyway: review changes as carefully as code and keep the data directory’s hashes/artifacts for provenance.
 
+## PR review readiness
+
+The reviewer is dispatched by `pull_request.ready_for_review`, not by `opened` or `synchronize`. Implementation PRs remain draft while CI-dependent work is unfinished. If no review arrives, confirm that CI runs for draft PRs, inspect checks for the exact head, and verify that the implementer marked the PR ready after they passed. To request review for an existing non-draft PR under this policy, convert it to draft and then mark it ready. A failed check should be fixed before readiness; do not use a review run as a substitute for CI.
+
 ## Waiting on dependencies
 
-A workflow in `waiting` is paused without consuming a worker. Confirm its dependency issues and PRs with `workflows show <workflow-id>`. A dependency resolves only after a completed issue closure and its linked merged PR are both observed. Check that the dependency PR body contains a closing reference such as `Closes #456` and that the issue was not closed manually long before the merge.
+A workflow in `waiting` is paused without consuming a worker. Confirm its dependency issues and PRs with `workflows show <workflow-id>`. A dependency resolves only after a completed issue closure and its linked merged PR are both observed. Check that the dependency PR body contains a closing reference such as `Closes #456` and that the issue was not closed manually long before the merge. When `commit_id` is present, it must match the merge SHA. When squash merging leaves it null, the issue-close actor must match the PR merger and close within five minutes.
 
-When every dependency resolves, one internal `dependency-resume-*` run is queued. Startup recovery retries incomplete resume delivery. A `failed` dependency request is intentionally not retried automatically because GitHub issue creation may have completed during the failure window. Reconcile it explicitly:
+When dependency discussion is configured, `@implementer` comments can run discussion-only turns while the workflow remains `waiting`. Applying `ready-for-human-approval` closes those turns and broker replies without approving implementation; remove it to reopen discussion. The human-only `approved` label remains the implementation gate.
+
+When every dependency resolves, one internal `dependency-resume-*` run is queued. Startup recovery retries incomplete resume delivery. If the merged change is incomplete, the resume turn can create a focused follow-up with a new request key; this starts the next dependency cycle while preserving the workflow, session, worktree, branch, and PR. A `failed` dependency request is intentionally not retried automatically because GitHub issue creation may have completed during the failure window. Reconcile it explicitly:
 
 ```sh
 # If the issue exists, verify its dependency marker and attach it
@@ -75,6 +84,8 @@ The delivery/rule dispatch is `skipped` with a turn-limit reason. Read the discu
 ## Token or runtime outages
 
 Pre-runtime failures enter `retry_wait` with exponential backoff. Check `doctor` and service logs. Other runtime-start failures do not auto-replay, even when they look transient, because the exact point of failure is not a safe transaction boundary.
+
+GitHub App installation tokens expire after about one hour. At run startup, Gerry reuses a cached token only when its remaining lifetime covers the agent's configured attempt timeout plus one minute; otherwise, it issues a fresh token. This prevents a long attempt from starting with a token that is already near expiry.
 
 A structured provider-quota error also enters `retry_wait`, but preserves the active workflow and retries indefinitely: after five minutes initially, then with delays doubled up to one hour. The provider response does not necessarily include a reset timestamp, so these attempts are periodic probes rather than a claim about the exact reset time. `runs show` displays `availableAt`, and `summary.md` displays the next attempt time. The same run, session, worktree, and branch resume when an attempt is due. Restarting Gerry does not cancel the wait, and an idle retry wait consumes no worker. Use `runs cancel` if waiting is no longer desired; use `runs retry` once for a quota run that already reached `failed` under an older Gerry version.
 

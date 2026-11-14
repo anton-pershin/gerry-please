@@ -3,3 +3,5 @@ Implement approved issue #{{issue.number}}: {{issue.title}}. This implies creati
 Approved requirements:
 
 {{issue.body}}
+
+Read the surrounding discussion as it may clarify the requirements further and pay attention to maintainer's advice.

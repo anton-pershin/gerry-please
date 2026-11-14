@@ -39,20 +39,22 @@ const runtimeSchema = z.discriminatedUnion("type", [
     .strict(),
 ]);
 
+const dependencyTurnSchema = z
+  .object({
+    agent: z.string().min(1),
+    prompt: z.string().min(1),
+    workflow: z.string().min(1),
+    max_turns: z.number().int().min(1).max(1000).default(20),
+  })
+  .strict();
+
 const dependencySchema = z
   .object({
     from: z.string().regex(/^[^/]+\/[^/]+$/),
     to: z.string().regex(/^[^/]+\/[^/]+$/),
     allow_issue_creation: z.boolean().default(false),
-    resume: z
-      .object({
-        agent: z.string().min(1),
-        prompt: z.string().min(1),
-        workflow: z.string().min(1),
-        max_turns: z.number().int().min(1).max(1000).default(20),
-      })
-      .strict()
-      .optional(),
+    resume: dependencyTurnSchema.optional(),
+    discussion: dependencyTurnSchema.optional(),
   })
   .strict();
 
@@ -196,11 +198,14 @@ const configSchema = z
       if (dependency.from === dependency.to) {
         context.addIssue({ code: "custom", message: "Dependency repositories must differ", path: ["dependencies", index] });
       }
-      if (dependency.resume && !config.agents[dependency.resume.agent]) {
-        context.addIssue({ code: "custom", message: `Unknown agent: ${dependency.resume.agent}`, path: ["dependencies", index, "resume", "agent"] });
-      }
-      if (dependency.resume && config.agents[dependency.resume.agent]?.workspace !== "worktree") {
-        context.addIssue({ code: "custom", message: "Dependency resume agents must use workspace: worktree", path: ["dependencies", index, "resume", "agent"] });
+      for (const kind of ["resume", "discussion"] as const) {
+        const turn = dependency[kind];
+        if (turn && !config.agents[turn.agent]) {
+          context.addIssue({ code: "custom", message: `Unknown agent: ${turn.agent}`, path: ["dependencies", index, kind, "agent"] });
+        }
+        if (turn && config.agents[turn.agent]?.workspace !== "worktree") {
+          context.addIssue({ code: "custom", message: `Dependency ${kind} agents must use workspace: worktree`, path: ["dependencies", index, kind, "agent"] });
+        }
       }
     }
     for (const [name, agent] of Object.entries(config.agents)) {

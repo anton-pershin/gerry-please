@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { afterEach, describe, expect, test } from "bun:test";
 import { readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { DependencyService } from "../src/dependencies.ts";
+import { DEPENDENCY_READY_LABEL, DependencyService } from "../src/dependencies.ts";
 import { Logger } from "../src/observability.ts";
 import { buildContext } from "../src/rules.ts";
 import { Store } from "../src/store.ts";
@@ -40,6 +40,86 @@ function dependencyPrMerged(number: number, deliveryId: string, mergeCommitSha?:
     ...(mergeCommitSha ? { mergeCommitSha } : {}),
     ...(baseRef ? { baseRef } : {}),
   });
+}
+
+function dependencyIssueComment(
+  number: number,
+  deliveryId: string,
+  input: { id: number; body: string; labels?: string[] },
+): WebhookContext {
+  const payload = issuePayload("created");
+  payload.installation = { id: 5678 };
+  (payload.repository as Record<string, unknown>).full_name = "acme/library";
+  (payload.issue as Record<string, unknown>).number = number;
+  (payload.issue as Record<string, unknown>).labels = (input.labels ?? []).map((name) => ({ name }));
+  payload.comment = { id: input.id, body: input.body };
+  payload.sender = { login: "alice" };
+  return buildContext({ deliveryId, event: "issue_comment", action: "created", payload });
+}
+
+async function dependencyDiscussionSetup(discussionAgent?: string, onIssueLookup?: () => void) {
+  const fixture = workflowConfigFixture(true);
+  if (discussionAgent) {
+    fixture.config.agents[discussionAgent] = { ...fixture.config.agents.implementer! };
+    fixture.config.dependencies[0]!.discussion!.agent = discussionAgent;
+  }
+  directories.push(fixture.directory);
+  initializeOrigin(fixture.directory);
+  const store = new Store(fixture.config.dataDir);
+  const labels: string[] = [];
+  const comments: Array<{ body: string }> = [];
+  const updates: Array<{ body: string }> = [];
+  const service = new DependencyService(
+    fixture.config,
+    store,
+    {
+      createIssue: async (repository) => ({ number: 456, url: `https://github.com/${repository}/issues/456` }),
+      getIssue: async (repository) => {
+        onIssueLookup?.();
+        return { number: 456, url: `https://github.com/${repository}/issues/456`, body: "Requirements", labels };
+      },
+      createIssueComment: async (_repository, _issueNumber, body) => {
+        comments.push({ body });
+        return { id: 987, url: "https://github.com/acme/library/issues/456#issuecomment-987" };
+      },
+      updateIssueBody: async (repository, _issueNumber, body) => {
+        updates.push({ body });
+        return { number: 456, url: `https://github.com/${repository}/issues/456` };
+      },
+      verifyIssueClosedByPullRequest: async () => true,
+    },
+    new Logger(join(fixture.config.dataDir, "service.jsonl"), undefined, false),
+  );
+  const inputs: RuntimeRunInput[] = [];
+  const runtime: AgentRuntime = {
+    type: "hermes",
+    check: async () => {},
+    run: async (input) => {
+      inputs.push(input);
+      return { sessionId: "parent-session", response: "continued" };
+    },
+  };
+  const workers = new WorkerPool({
+    config: fixture.config,
+    store,
+    runtimes: new Map([["hermes", runtime]]),
+    tokens: { get: async () => "token" },
+    logger: new Logger(join(fixture.config.dataDir, "worker.jsonl"), undefined, false),
+    runGate: service,
+  });
+  enqueueWorkflow(store, fixture, issueContext(), "implement-approved-issue");
+  await workers.runNext("worker-parent");
+  const parentRun = store.listRuns(1)[0]!;
+  const workflow = store.getWorkflow(parentRun.workflowId!);
+  const response = await service.requestDependency(parentRun.id, {
+    to: "acme/library",
+    title: "Required API",
+    body: "Please provide the required API",
+    requestKey: "discussion-api",
+  });
+  expect(response.status).toBe(201);
+  expect(store.getWorkflow(workflow.id).status).toBe("waiting");
+  return { fixture, store, service, workflow, parentRun, workers, inputs, labels, comments, updates };
 }
 
 describe("cross-repository dependencies", () => {
@@ -135,31 +215,29 @@ describe("cross-repository dependencies", () => {
     expect(await service.recover()).toBe(0);
     expect(store.listRuns(20).filter((run) => run.ruleName.startsWith("dependency-resume"))).toHaveLength(1);
 
-    const nextCycle = store.beginDependencyRequest({
-      parentWorkflowId: workflowId,
-      parentRepository: "acme/widgets",
-      targetRepository: "acme/library",
-      requestKey: "third-api",
-      title: "Third API",
-      body: "A later dependency round",
-      createdByRunId: resumes[0]!.id,
-    });
-    store.finishDependencyRequest(nextCycle.dependency.id, {
-      number: 458,
-      url: "https://github.com/acme/library/issues/458",
-    });
-    await service.track(dependencyIssueClosed(458, "dep-458-closed"));
-    await service.track(dependencyPrMerged(458, "dep-458-merged"));
-    const allResumes = store.listRuns(20).filter((run) => run.ruleName.startsWith("dependency-resume"));
-    expect(allResumes).toHaveLength(2);
-    expect(allResumes.some((run) => run.ruleName.endsWith("cycle-2"))).toBe(true);
-
+    const followUpResponses: Response[] = [];
     const inputs: RuntimeRunInput[] = [];
     const runtime: AgentRuntime = {
       type: "hermes",
       check: async () => {},
       run: async (input) => {
         inputs.push(input);
+        if (input.runId === resumes[0]!.id) {
+          const url = input.environment.GERRY_DEPENDENCY_URL;
+          const capability = input.environment.GERRY_AGENT_TOKEN;
+          expect(url).toContain("/agent/dependencies");
+          expect(capability).toBeDefined();
+          followUpResponses.push(await service.handleAgentRequest(new Request(url!, {
+            method: "POST",
+            headers: { authorization: `Bearer ${capability}`, "content-type": "application/json" },
+            body: JSON.stringify({
+              to: "acme/library",
+              title: "Third API",
+              body: "The merged dependency left a distinct remaining gap",
+              requestKey: "third-api",
+            }),
+          })));
+        }
         return { sessionId: "parent-session", response: "resumed" };
       },
     };
@@ -170,9 +248,26 @@ describe("cross-repository dependencies", () => {
       tokens: { get: async () => "token" },
       logger: new Logger(join(fixture.config.dataDir, "worker.jsonl"), undefined, false),
     });
-    for (let index = 0; index < 3; index += 1) await workers.runNext("worker-resume");
+    for (let index = 0; index < 3 && store.getRun(resumes[0]!.id).status !== "succeeded"; index += 1) {
+      await workers.runNext("worker-resume");
+    }
+    expect(store.getRun(resumes[0]!.id).status).toBe("succeeded");
+    expect(followUpResponses.map((response) => response.status)).toEqual([201]);
+    const nextCycle = store.listWorkflowDependencies(workflowId).find((dependency) => dependency.requestKey === "third-api")!;
+    expect(nextCycle.cycle).toBe(2);
+    expect(nextCycle.createdByRunId).toBe(resumes[0]!.id);
+    expect(store.getWorkflow(workflowId).status).toBe("waiting");
+
+    await service.track(dependencyIssueClosed(458, "dep-458-closed"));
+    await service.track(dependencyPrMerged(458, "dep-458-merged"));
+    const allResumes = store.listRuns(20).filter((run) => run.ruleName.startsWith("dependency-resume"));
+    expect(allResumes).toHaveLength(2);
+    const secondResume = allResumes.find((run) => run.ruleName.endsWith("cycle-2"))!;
+    for (let index = 0; index < 3 && store.getRun(secondResume.id).status !== "succeeded"; index += 1) {
+      await workers.runNext("worker-resume");
+    }
     expect(store.listRuns(20).filter((run) => run.ruleName.startsWith("dependency-resume") && run.status === "succeeded")).toHaveLength(2);
-    expect(inputs.some((input) => input.prompt.includes("458"))).toBe(true);
+    expect(inputs.find((input) => input.runId === secondResume.id)?.prompt).toContain("458");
     store.close();
   });
 
@@ -278,7 +373,7 @@ describe("cross-repository dependencies", () => {
       {
         createIssue: async () => { throw new Error("not used"); },
         getIssue: async () => { throw new Error("not used"); },
-        verifyIssueClosedByPullRequest: async (_repository, _issue, mergeCommitSha) => mergeCommitSha === "closing-merge",
+        verifyIssueClosedByPullRequest: async (_repository, _issue, observation) => observation.mergeCommitSha === "closing-merge",
       },
       new Logger(join(fixture.config.dataDir, "service.jsonl"), undefined, false),
     );
@@ -397,7 +492,7 @@ describe("cross-repository dependencies", () => {
     store.close();
   });
 
-  test("completes a waiting workflow on approval without resuming dependencies", async () => {
+  test("keeps a waiting workflow paused on approval and completes it only on merge", async () => {
     const fixture = workflowConfigFixture(true);
     directories.push(fixture.directory);
     const store = new Store(fixture.config.dataDir);
@@ -425,7 +520,7 @@ describe("cross-repository dependencies", () => {
       action: "submitted",
       reviewState: "approved",
     });
-    expect(store.linkWorkflowPullRequest(approval)?.status).toBe("completed");
+    expect(store.linkWorkflowPullRequest(approval)?.status).toBe("waiting");
     const service = new DependencyService(
       fixture.config,
       store,
@@ -438,6 +533,193 @@ describe("cross-repository dependencies", () => {
     );
     expect(await service.recover()).toBe(0);
     expect(store.listRuns(20).filter((candidate) => candidate.ruleName.startsWith("dependency-resume"))).toHaveLength(0);
+    const merged = prContext({
+      number: 100,
+      branch: workflow.branch!,
+      deliveryId: "merge-waiting",
+      event: "pull_request",
+      action: "closed",
+      merged: true,
+    });
+    expect(store.linkWorkflowPullRequest(merged)?.status).toBe("completed");
+    expect(await service.recover()).toBe(0);
+    expect(store.listRuns(20).filter((candidate) => candidate.ruleName.startsWith("dependency-resume"))).toHaveLength(0);
+    store.close();
+  });
+
+  test("routes dependency comments to the requester while waiting and gates them with readiness labels", async () => {
+    const { store, service, workflow, workers, inputs, labels } = await dependencyDiscussionSetup();
+    const comment = dependencyIssueComment(456, "dependency-comment-1", {
+      id: 101,
+      body: "@implementer Please clarify the pagination requirement",
+    });
+    await service.track(comment);
+    let discussions = store.listRuns(20).filter((run) => run.ruleName.startsWith("dependency-discussion"));
+    expect(discussions).toHaveLength(1);
+    expect(discussions[0]!.workflowId).toBe(workflow.id);
+    expect(discussions[0]!.allowWaiting).toBe(true);
+    expect(store.getWorkflow(workflow.id).status).toBe("waiting");
+
+    await service.track(comment);
+    expect(store.listRuns(20).filter((run) => run.ruleName.startsWith("dependency-discussion"))).toHaveLength(1);
+    await service.track(dependencyIssueComment(456, "dependency-comment-ready", {
+      id: 102,
+      body: "@implementer This must not run",
+      labels: [DEPENDENCY_READY_LABEL],
+    }));
+    expect(store.listRuns(20).filter((run) => run.ruleName.startsWith("dependency-discussion"))).toHaveLength(1);
+
+    await workers.runNext("worker-discussion");
+    expect(inputs).toHaveLength(2);
+    expect(inputs[0]!.prompt).toContain("Cross-repository dependency requests are allowed only for");
+    expect(inputs[0]!.prompt).toContain("- `acme/library`");
+    expect(inputs[0]!.prompt).toContain("including upstream third-party libraries");
+    expect(inputs[1]!.existingSessionId).toBe("parent-session");
+    expect(inputs[1]!.prompt).toContain("Please clarify the pagination requirement");
+    expect(store.getWorkflow(workflow.id).status).toBe("waiting");
+    expect(store.getRun(discussions[0]!.id).status).toBe("succeeded");
+
+    await service.track(dependencyIssueComment(456, "dependency-comment-reopened", {
+      id: 103,
+      body: "@implementer The human reopened discussion",
+    }));
+    discussions = store.listRuns(20).filter((run) => run.ruleName.startsWith("dependency-discussion"));
+    expect(discussions).toHaveLength(2);
+    expect(store.getWorkflow(workflow.id).status).toBe("waiting");
+
+    labels.push(DEPENDENCY_READY_LABEL);
+    await workers.runNext("worker-gated");
+    expect(inputs).toHaveLength(2);
+    expect(store.getRun(discussions[0]!.id).status).toBe("cancelled");
+    expect(store.getWorkflow(workflow.id).status).toBe("waiting");
+    labels.length = 0;
+    await service.track(dependencyIssueComment(456, "dependency-comment-reopened-again", {
+      id: 104,
+      body: "@implementer Discussion is open again",
+    }));
+    expect(store.listRuns(20).filter((run) => run.ruleName.startsWith("dependency-discussion"))).toHaveLength(3);
+    labels.push("approved");
+    await workers.runNext("worker-approved-gated");
+    expect(inputs).toHaveLength(2);
+    expect(store.listRuns(20).filter((run) => run.ruleName.startsWith("dependency-discussion"))[0]!.status).toBe("cancelled");
+    labels.length = 0;
+    await service.track(dependencyIssueComment(456, "dependency-comment-final-reopen", {
+      id: 105,
+      body: "@implementer Open once more",
+    }));
+    expect(store.listRuns(20).filter((run) => run.ruleName.startsWith("dependency-discussion"))).toHaveLength(4);
+    store.close();
+  });
+
+  test("rejects late broker comments and ignores broker-authored comment webhooks", async () => {
+    const { store, service, workflow, labels, comments } = await dependencyDiscussionSetup();
+    await service.track(dependencyIssueComment(456, "dependency-comment-broker", {
+      id: 201,
+      body: "@implementer Answer the maintainer",
+    }));
+    const claimed = store.claimNext("worker-discussion")!;
+    const capability = "dependency-comment-capability";
+    store.setAgentCapability(claimed.id, createHash("sha256").update(capability).digest("hex"), "worker-discussion");
+    const dependency = store.listWorkflowDependencies(workflow.id)[0]!;
+    const request = () => new Request("http://localhost/agent/dependencies/comments", {
+      method: "POST",
+      headers: { authorization: `Bearer ${capability}`, "content-type": "application/json" },
+      body: JSON.stringify({ dependencyId: dependency.id, body: "Proposed clarification" }),
+    });
+
+    labels.push(DEPENDENCY_READY_LABEL);
+    expect((await service.handleAgentComment(request())).status).toBe(409);
+    expect(comments).toHaveLength(0);
+    labels.length = 0;
+    expect((await service.handleAgentComment(request())).status).toBe(201);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]!.body).toContain(`gerry:run=${claimed.id}`);
+    expect(comments[0]!.body).toContain(`gerry:dependency-comment=${dependency.id}`);
+
+    await service.track(dependencyIssueComment(456, "dependency-comment-from-broker", {
+      id: 987,
+      body: `@implementer Ignore this broker reply\n\n<!-- gerry:dependency-comment=${dependency.id} -->`,
+    }));
+    expect(store.listRuns(20).filter((run) => run.ruleName.startsWith("dependency-discussion"))).toHaveLength(1);
+
+    store.abandonDependency(dependency.id, "No longer needed");
+    expect((await service.handleAgentComment(request())).status).toBe(409);
+    store.db.query("UPDATE dependencies SET status = 'pending' WHERE id = ?").run(dependency.id);
+    store.markDependencyResolved(dependency.id, {
+      prNumber: 999,
+      prUrl: null,
+      mergeCommitSha: "abc123",
+      mergedAt: Date.now(),
+      baseRef: "main",
+    });
+    expect((await service.handleAgentComment(request())).status).toBe(409);
+    store.db.query("UPDATE dependencies SET status = 'pending' WHERE id = ?").run(dependency.id);
+    store.activateWorkflowForResume(workflow.id);
+    expect((await service.handleAgentComment(request())).status).toBe(409);
+    expect(comments).toHaveLength(1);
+    store.close();
+  });
+
+  test("updates dependency issue bodies through the broker with readiness gates and a preserved marker", async () => {
+    const { store, service, workflow, labels, updates } = await dependencyDiscussionSetup();
+    await service.track(dependencyIssueComment(456, "dependency-comment-body-update", {
+      id: 225,
+      body: "@implementer Please revise the requirements",
+    }));
+    const claimed = store.claimNext("worker-body-update")!;
+    const capability = "dependency-body-update-capability";
+    store.setAgentCapability(claimed.id, createHash("sha256").update(capability).digest("hex"), "worker-body-update");
+    const dependency = store.listWorkflowDependencies(workflow.id)[0]!;
+    const request = () => new Request("http://localhost/agent/dependencies/issue", {
+      method: "PATCH",
+      headers: { authorization: `Bearer ${capability}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        dependencyId: dependency.id,
+        body: "## Summary\nCollect papers.\n\n## Current situation\nNo collector.\n\n## Desired outcome\nCollect by date.\n\n## Why this matters\nResearch requires it.\n\n<!-- gerry:dependency=wrong -->",
+      }),
+    });
+
+    labels.push(DEPENDENCY_READY_LABEL);
+    expect((await service.handleAgentIssueUpdate(request())).status).toBe(409);
+    expect(updates).toHaveLength(0);
+    labels.length = 0;
+    expect((await service.handleAgentIssueUpdate(request())).status).toBe(200);
+    expect(updates).toHaveLength(1);
+    expect(updates[0]!.body).toContain("## Summary");
+    expect(updates[0]!.body).toContain("## Current situation");
+    expect(updates[0]!.body).toContain("## Desired outcome");
+    expect(updates[0]!.body).toContain("## Why this matters");
+    expect(updates[0]!.body).not.toContain("gerry:dependency=wrong");
+    const marker = Buffer.from(JSON.stringify({ id: dependency.id, workflow: workflow.id })).toString("base64url");
+    expect(updates[0]!.body).toContain(`<!-- gerry:dependency=${marker} -->`);
+    store.close();
+  });
+
+  test("rejects a parent resumed while the issue lookup is in flight", async () => {
+    const holder: { store?: Store; workflowId?: string } = {};
+    const { store, service, workflow } = await dependencyDiscussionSetup(undefined, () => {
+      holder.store!.activateWorkflowForResume(holder.workflowId!);
+    });
+    holder.store = store;
+    holder.workflowId = workflow.id;
+    await service.track(dependencyIssueComment(456, "dependency-comment-in-flight", {
+      id: 251,
+      body: "@implementer Reply",
+    }));
+    const claimed = store.claimNext("worker-in-flight")!;
+    const result = await service.check(claimed);
+    expect(result).toEqual({ allowed: false, reason: "Parent workflow is no longer waiting for this dependency" });
+    store.close();
+  });
+
+  test("rejects a discussion agent that differs from the dependency requester", async () => {
+    const { store, service, workflow } = await dependencyDiscussionSetup("other-implementer");
+    await service.track(dependencyIssueComment(456, "dependency-comment-wrong-agent", {
+      id: 301,
+      body: "@implementer Please reply",
+    }));
+    expect(store.listRuns(20).filter((run) => run.ruleName.startsWith("dependency-discussion"))).toHaveLength(0);
+    expect(store.getWorkflow(workflow.id).status).toBe("waiting");
     store.close();
   });
 

@@ -37,6 +37,21 @@ export function workflowConfigFixture(withDependencies = false) {
       max_turns: 20,
       once_per_subject: false,
     },
+    {
+      name: "address-pr-conversation-comment",
+      on: { event: "issue_comment", actions: ["created"] },
+      when: [
+        { path: "issue.pull_request", exists: true },
+        { path: "comment.body", contains: "@implementer", ignore_case: true },
+      ],
+      agent: "implementer",
+      prompt: "review.md",
+      session: "workflow",
+      workflow: "implementation",
+      workflow_start: false,
+      max_turns: 20,
+      once_per_subject: false,
+    },
   ];
   writeFileSync(join(fixture.directory, "review.md"), "Address review on PR #{{pull_request.number}} in {{workflow.id}}\n");
   if (withDependencies) {
@@ -51,8 +66,15 @@ export function workflowConfigFixture(withDependencies = false) {
         workflow: "implementation",
         max_turns: 20,
       },
+      discussion: {
+        agent: "implementer",
+        prompt: "dependency-discussion.md",
+        workflow: "implementation",
+        max_turns: 20,
+      },
     }];
     writeFileSync(join(fixture.directory, "resume.md"), "Resume after {{dependency.targetIssueUrl}} at {{dependency.mergeCommitSha}}\n");
+    writeFileSync(join(fixture.directory, "dependency-discussion.md"), "Discuss {{discussion.issueUrl}}: {{discussion.body}}\n");
   }
   writeFileSync(path, stringify(raw));
   return { ...fixture, config: loadConfig(path) };
@@ -101,6 +123,29 @@ export function prContext(input: {
   if (event === "pull_request_review_comment") payload.comment = { body: "@implementer please address this" };
   if (input.reviewState) payload.review = { state: input.reviewState, body: "" };
   return buildContext({ deliveryId: input.deliveryId ?? `pr-${number}-${action}`, event, action, payload });
+}
+
+export function prConversationContext(input: {
+  number?: number;
+  deliveryId?: string;
+  body?: string;
+  repository?: string;
+}): WebhookContext {
+  const number = input.number ?? 100;
+  const repository = input.repository ?? "acme/widgets";
+  const payload = issuePayload("created");
+  payload.repository = { full_name: repository, html_url: `https://github.com/${repository}` };
+  const issue = payload.issue as Record<string, unknown>;
+  issue.number = number;
+  issue.title = "Implementation";
+  issue.pull_request = { url: `https://api.github.com/repos/${repository}/pulls/${number}` };
+  payload.comment = { body: input.body ?? "@implementer please resolve the conflicts" };
+  return buildContext({
+    deliveryId: input.deliveryId ?? `pr-${number}-conversation`,
+    event: "issue_comment",
+    action: "created",
+    payload,
+  });
 }
 
 export function enqueueWorkflow(store: Store, fixture: ReturnType<typeof workflowConfigFixture>, context: WebhookContext, ruleName: string) {

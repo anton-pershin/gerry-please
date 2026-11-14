@@ -161,6 +161,12 @@ export class OpenCodeRuntime implements AgentRuntime {
       input.onSession(sessionId);
       input.emit({ type: "runtime.session", data: { runtime: "opencode", sessionId, resumed: Boolean(input.existingSessionId) } });
       await this.client.session.environment({ sessionID: sessionId, variables: input.environment }, { signal });
+      input.emit({
+        type: "opencode.environment.applied",
+        data: {
+          dependencyBrokerConfigured: Boolean(input.environment.GERRY_DEPENDENCY_URL && input.environment.GERRY_AGENT_TOKEN),
+        },
+      });
 
       let markReady!: () => void;
       let failReady!: (error: Error) => void;
@@ -182,6 +188,13 @@ export class OpenCodeRuntime implements AgentRuntime {
               streamedText += event.data.delta;
             } else if (event.type === "session.execution.failed") {
               executionError = event.data.error;
+            } else if (event.type === "session.tool.input.started" || event.type === "session.tool.called") {
+              try {
+                await this.client.session.environment({ sessionID: sessionId, variables: input.environment }, { signal });
+              } catch (error) {
+                input.emit({ type: "opencode.environment.refresh_failed", data: { error: compactError(error) } });
+                throw error;
+              }
             } else if (event.type === "permission.asked") {
               await this.client.permission.reply({
                 sessionID: sessionId,

@@ -202,6 +202,12 @@ export function createFetchHandler(input: {
     if (url.pathname === "/agent/dependencies" && input.dependencies) {
       return input.dependencies.handleAgentRequest(request);
     }
+    if (url.pathname === "/agent/dependencies/comments" && input.dependencies) {
+      return input.dependencies.handleAgentComment(request);
+    }
+    if (url.pathname === "/agent/dependencies/issue" && input.dependencies) {
+      return input.dependencies.handleAgentIssueUpdate(request);
+    }
     return response({ error: "Not found" }, 404);
   };
 }

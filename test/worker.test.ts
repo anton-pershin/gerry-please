@@ -34,10 +34,10 @@ function setup(behavior: (input: RuntimeRunInput) => Promise<{ sessionId: string
   const store = new Store(fixture.config.dataDir);
   const runtime = new FakeRuntime(behavior);
   const logger = new Logger(join(fixture.config.dataDir, "service.jsonl"), undefined, false);
-  const tokenCalls: Array<[number, string]> = [];
+  const tokenCalls: Array<[number, string, number | undefined]> = [];
   const tokens = {
-    get: async (installationId: number, repository: string) => {
-      tokenCalls.push([installationId, repository]);
+    get: async (installationId: number, repository: string, minimumLifetimeMs?: number) => {
+      tokenCalls.push([installationId, repository, minimumLifetimeMs]);
       if (failToken) throw new Error("token service unavailable");
       return "secret-installation-token";
     },
@@ -100,7 +100,7 @@ describe("worker execution", () => {
     expect(fixture.runtime.inputs[0]!.prompt).not.toContain("Changed after enqueue");
     expect(fixture.runtime.inputs[0]!.prompt).not.toContain("Changed instructions");
     expect(fixture.runtime.inputs[0]!.prompt).toContain("<!-- gerry:run=");
-    expect(fixture.tokenCalls).toEqual([[1234, "acme/widgets"]]);
+    expect(fixture.tokenCalls).toEqual([[1234, "acme/widgets", 1_860_000]]);
     const events = readFileSync(join(fixture.config.dataDir, "runs", run.id, "attempts", "1", "events.jsonl"), "utf8");
     const response = readFileSync(join(fixture.config.dataDir, "runs", run.id, "response.md"), "utf8");
     expect(events).not.toContain("secret-installation-token");

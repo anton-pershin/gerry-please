@@ -27,6 +27,7 @@ Commands:
   status                      Show run counts by state
   workflows list              List workflow instances and their current state
   workflows show ID           Show a workflow and its dependencies
+  workflows abandon ID        Archive a closed-unmerged workflow and release its ledger
   dependencies list           List cross-repository dependency requests
   dependencies attach ID --issue-number N
                                 Attach a verified issue after ambiguous creation
@@ -64,11 +65,14 @@ function validateFiles(config: LoadedConfig): string[] {
     }
   }
   for (const [index, dependency] of config.dependencies.entries()) {
-    if (!dependency.resume) continue;
-    try {
-      readPrompt(config, dependency.resume.prompt);
-    } catch (error) {
-      problems.push(`Dependency ${index} resume: ${compactError(error)}`);
+    for (const kind of ["resume", "discussion"] as const) {
+      const turn = dependency[kind];
+      if (!turn) continue;
+      try {
+        readPrompt(config, turn.prompt);
+      } catch (error) {
+        problems.push(`Dependency ${index} ${kind}: ${compactError(error)}`);
+      }
     }
   }
   for (const [name, agent] of Object.entries(config.agents)) {
@@ -126,8 +130,8 @@ async function serve(config: LoadedConfig, skipChecks: boolean): Promise<void> {
       logger.info("runtime.ready", { runtime: name, type: runtime.type });
     }
   }
-  const workers = new WorkerPool({ config, store, runtimes, tokens, logger });
   const dependencies = new DependencyService(config, store, tokens, logger);
+  const workers = new WorkerPool({ config, store, runtimes, tokens, logger, runGate: dependencies });
   const webhook = new WebhookHandler(config, store, secrets, logger, dependencies);
   await webhook.recover();
   const server = Bun.serve({
@@ -189,6 +193,11 @@ async function main(): Promise<void> {
         console.log(JSON.stringify(store.getWorkflow(workflowId), null, 2));
         console.log(JSON.stringify(store.listWorkflowDependencies(workflowId), null, 2));
         return;
+      }
+      if (subcommand === "abandon") {
+        const workflowId = args[args.indexOf("workflows") + 2];
+        if (!workflowId) throw new Error("Workflow ID is required");
+        return console.log(JSON.stringify(store.abandonWorkflow(workflowId), null, 2));
       }
     }
     if (command === "dependencies") {
