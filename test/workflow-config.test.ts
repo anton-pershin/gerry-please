@@ -14,8 +14,9 @@ describe("workflow and dependency configuration", () => {
   test("loads workflow rules and dependency resume policies", () => {
     const fixture = workflowConfigFixture(true);
     directories.push(fixture.directory);
-    expect(fixture.config.rules[0]!.workflow_start).toBe(true);
-    expect(fixture.config.rules[1]!.workflow_start).toBe(false);
+    expect(fixture.config.rules.find((rule) => rule.name === "investigate-issue")?.workflow_start).toBe(true);
+    expect(fixture.config.rules.find((rule) => rule.name === "implement-approved-issue")?.workflow_start).toBe(true);
+    expect(fixture.config.rules.find((rule) => rule.name === "address-pr-review")?.workflow_start).toBe(false);
     expect(fixture.config.dependencies[0]!.resume?.workflow).toBe("implementation");
   });
 

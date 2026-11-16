@@ -132,17 +132,17 @@ Run one Gerry process per data directory. SQLite WAL protects database access, b
 
 ## Example workflows
 
-### Issue approval and implementation
+### Issue approval, investigation, and implementation
 
-1. A new issue triggers `triage-new-issue` and a fresh OpenCode maintainer session.
-2. The maintainer comments and applies `approved` when requirements are actionable.
-3. The label event triggers `implement-approved-issue` once for that issue.
-4. A fresh Hermes session receives a dedicated worktree and `gerry/<run-id>` branch.
-5. The implementer writes `specs/issue-<n>.md`, implements and tests it, pushes the branch, and opens a draft PR. It waits for CI on the exact head, fixes failures while still draft, and marks the PR ready only after relevant local checks and CI pass.
-6. The `ready_for_review` event triggers the reviewer; opening or pushing an unfinished PR does not. Gerry associates the PR head branch with the same workflow, and review comments resume the same implementer session and worktree. Before pushing an unfinished review revision, the implementer converts the PR back to draft and repeats the CI gate.
+1. A new issue triggers `triage-new-issue` and a fresh maintainer session.
+2. The maintainer comments and applies `approved` when requirements are actionable. With the human-approval gate, the maintainer instead applies `ready-for-human-approval`, and the human chooses between `approved` and `requires-investigation`.
+3. `requires-investigation` starts the implementation workflow in its `investigation` phase. The implementer follows the SDD investigation workflow and posts the results to the origin issue without implementing or opening a PR. Further `@implementer` comments resume the same session and worktree for investigation discussion; the maintainer remains mention-only.
+4. Applying `approved` moves that same workflow into `implementation`, or starts it directly there when no prior investigation was requested. The implementer resumes the investigation and discussion context, writes the specification, implements and tests the change, pushes the branch, and opens a draft PR.
+5. The implementer waits for CI on the exact head, fixes failures while still draft, and marks the PR ready only after relevant local checks and CI pass. The `ready_for_review` event triggers the reviewer; opening or pushing an unfinished PR does not.
+6. Gerry associates the PR head branch with the same workflow, and review comments resume the same implementer session and worktree. Before pushing an unfinished review revision, the implementer converts the PR back to draft and repeats the CI gate.
 7. Independent issues create independent workflow instances that can run in parallel. An approving review leaves the workflow active for follow-up turns. Merging the PR completes it; closing it without merging marks it closed.
 
-The rule engine does not parse an agent’s natural-language response to infer `approved`; the GitHub label is the explicit handoff.
+The rule engine does not parse an agent’s natural-language response to infer `approved`; the GitHub label is the explicit handoff. Investigation and implementation turns share the workflow's turn budget.
 
 ### Waiting for a dependency in another repository
 

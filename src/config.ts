@@ -129,6 +129,7 @@ const configSchema = z
             conversation: z.string().min(1).optional(),
             workflow: z.string().min(1).optional(),
             workflow_start: z.boolean().default(false),
+            workflow_phase: z.string().min(1).optional(),
             max_turns: z.number().int().min(1).max(1000).default(12),
             once_per_subject: z.boolean().default(false),
           })
@@ -155,10 +156,10 @@ const configSchema = z
           path: ["rules", index, "conversation"],
         });
       }
-      if (rule.session !== "workflow" && (rule.workflow || rule.workflow_start)) {
+      if (rule.session !== "workflow" && (rule.workflow || rule.workflow_start || rule.workflow_phase)) {
         context.addIssue({
           code: "custom",
-          message: "workflow and workflow_start are only valid when session is workflow",
+          message: "workflow, workflow_start, and workflow_phase are only valid when session is workflow",
           path: ["rules", index, "workflow"],
         });
       }

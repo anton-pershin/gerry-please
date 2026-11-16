@@ -45,6 +45,21 @@ describe("rule conditions", () => {
     expect(matches("synchronize")).toBe(false);
   });
 
+  test("configures investigation as a phase of the implementation workflow", () => {
+    const config = loadConfig(new URL("../gerry.example.yaml", import.meta.url).pathname);
+    const investigation = config.rules.find((candidate) => candidate.name === "investigate-issue")!;
+    const discussion = config.rules.find((candidate) => candidate.name === "discuss-issue-investigation")!;
+    const implementation = config.rules.find((candidate) => candidate.name === "implement-approved-issue")!;
+
+    expect(investigation.workflow).toBe("implementation");
+    expect(investigation.workflow_start).toBe(true);
+    expect(investigation.workflow_phase).toBe("investigation");
+    expect(discussion.workflow).toBe("implementation");
+    expect(discussion.workflow_start).toBe(false);
+    expect(discussion.workflow_phase).toBe("investigation");
+    expect(implementation.workflow_phase).toBe("implementation");
+  });
+
   test("distinguishes issue comments on pull requests", () => {
     const payload = issuePayload("created");
     payload.comment = { body: "@maintainer please review" };
