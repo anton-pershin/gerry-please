@@ -83,6 +83,7 @@ export interface WorkflowRecord {
   originSubjectType: SubjectType;
   originSubjectNumber: number;
   status: WorkflowStatus;
+  phase: string;
   workspacePath: string | null;
   branch: string | null;
   pullRequestNumber: number | null;

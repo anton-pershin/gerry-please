@@ -11,4 +11,4 @@ Leave the issue comment with your opinion. If you are satisfied with this issue,
 For a broker-created dependency issue (its body contains `gerry:dependency=`):
 - If clarification or changes are needed, ask specific questions with `@implementer`.
 
-Never apply `approved` yourself. The human maintainer will decide whether to apply it manually.
+Never apply `approved` or `requires-investigation` yourself. The human maintainer will decide whether and how implementation should proceed.

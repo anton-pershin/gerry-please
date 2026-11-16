@@ -12,7 +12,7 @@ bun run src/cli.ts runs list --status interrupted
 tail -f .gerry/logs/service.jsonl | jq .
 ```
 
-Open a run’s `summary.md`, then inspect `attempts/<n>/events.jsonl` and `response.md`. Use `deliveries show <id>` to see whether no rule matched, a turn budget stopped dispatch, a once-per-subject ledger already existed, or a run was queued. Use `workflows show <workflow-id>` to inspect PR linkage, active/waiting/closed/completed state, quarantine, and all dependencies. Approval leaves a workflow active; only a merged PR completes it.
+Open a run’s `summary.md`, then inspect `attempts/<n>/events.jsonl` and `response.md`. Use `deliveries show <id>` to see whether no rule matched, a turn budget or phase guard stopped dispatch, a once-per-subject ledger already existed, or a run was queued. Use `workflows show <workflow-id>` to inspect PR linkage, active/waiting/closed/completed state, investigation/implementation phase, quarantine, and all dependencies. Approval leaves a workflow active; only a merged PR completes it.
 
 ## Before any manual retry
 
@@ -58,6 +58,12 @@ Prompt/instruction contents are snapshotted at dispatch, so later file edits do 
 ## PR review readiness
 
 The reviewer is dispatched by `pull_request.ready_for_review`, not by `opened` or `synchronize`. Implementation PRs remain draft while CI-dependent work is unfinished. If no review arrives, confirm that CI runs for draft PRs, inspect checks for the exact head, and verify that the implementer marked the PR ready after they passed. To request review for an existing non-draft PR under this policy, convert it to draft and then mark it ready. A failed check should be fixed before readiness; do not use a review run as a substitute for CI.
+
+## Investigation before implementation
+
+With the investigation rules enabled, a human-applied `requires-investigation` label starts the implementation workflow in `investigation`. The implementer posts its SDD investigation to the origin issue but does not implement or open a PR. Continue the discussion only with comments that explicitly tag `@implementer`; untagged comments do not create a turn. The maintainer remains mention-only.
+
+Applying `approved` through the authorized human gate changes the same workflow to `implementation` and queues the implementation turn. The existing implementer session, worktree, branch, and issue discussion are retained. The old investigation label does not need to control routing: after the phase transition, further investigation-comment dispatches are skipped. Use `workflows show <workflow-id>` to inspect the current phase and `deliveries show <delivery-id>` to inspect a phase-mismatch skip.
 
 ## Waiting on dependencies
 

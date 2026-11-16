@@ -43,11 +43,15 @@ describe("configuration", () => {
     expect(() => loadConfig(path)).toThrow("mixes shared and worktree");
   });
 
-  test("rejects conversation groups on fresh rules", () => {
+  test("rejects conversation groups and workflow phases on non-matching rules", () => {
     const fixture = configFixture();
     directories.push(fixture.directory);
     const path = join(fixture.directory, "gerry.yaml");
     writeFileSync(path, `${readFileSync(path, "utf8")}    conversation: invalid\n`);
     expect(() => loadConfig(path)).toThrow("conversation");
+
+    const withoutConversation = readFileSync(path, "utf8").replace("    conversation: invalid\n", "");
+    writeFileSync(path, `${withoutConversation}    workflow_phase: investigation\n`);
+    expect(() => loadConfig(path)).toThrow("workflow_phase");
   });
 });
