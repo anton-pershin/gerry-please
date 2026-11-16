@@ -14,7 +14,7 @@ const quotaError = {
   response: { body: JSON.stringify({ error: { type: "exceeded_current_quota_error" } }) },
 };
 
-function fakeClient(sessionID = "opencode-session", executionError?: unknown, emitFailureEvent = true) {
+function fakeClient(sessionID = "opencode-session", executionError?: unknown, emitFailureEvent = true, toolCalls = 0) {
   const environmentCalls: Array<Record<string, string>> = [];
   const permissionReplies: Array<Record<string, unknown>> = [];
   const prompts: string[] = [];
@@ -46,6 +46,9 @@ function fakeClient(sessionID = "opencode-session", executionError?: unknown, em
         yield { type: "permission.asked", data: { id: "permission-1", sessionID, action: "shell", resources: ["rm *"] } };
         yield { type: "session.text.delta", data: { sessionID, delta: "Hello " } };
         yield { type: "session.text.delta", data: { sessionID, delta: "world" } };
+        for (let index = 0; index < toolCalls; index += 1) {
+          yield { type: "session.tool.called", data: { sessionID, id: `tool-${index}`, input: {}, executed: false } };
+        }
         if (executionError && emitFailureEvent) {
           yield { type: "session.execution.failed", data: { sessionID, error: executionError } };
           markExecutionObserved();
@@ -121,14 +124,14 @@ async function runExistingSession(
 }
 
 describe("OpenCode client adapter", () => {
-  test("waits asynchronously, rejects approvals, collects output, and cleans tokens", async () => {
+  test("waits asynchronously, refreshes environment per tool, rejects approvals, collects output, and cleans tokens", async () => {
     const directory = temporaryDirectory();
     try {
       const workspace = join(directory, "workspace");
       const attempt = join(directory, "attempt");
       mkdirSync(workspace, { recursive: true });
       mkdirSync(attempt, { recursive: true });
-      const fake = fakeClient();
+      const fake = fakeClient("opencode-session", undefined, true, 2);
       const runtime = new OpenCodeRuntime(fake.client, "fake");
       const events: RuntimeEvent[] = [];
       const result = await runtime.run({
@@ -151,7 +154,10 @@ describe("OpenCode client adapter", () => {
       expect(fake.prompts).toEqual(["Review the issue"]);
       expect(fake.messageListInputs[0]?.limit).toBe(200);
       expect(fake.permissionReplies[0]).toMatchObject({ requestID: "permission-1", decision: "reject" });
+      expect(fake.environmentCalls).toHaveLength(4);
       expect(fake.environmentCalls[0]?.GH_TOKEN).toBe("secret");
+      expect(fake.environmentCalls[1]?.GH_TOKEN).toBe("secret");
+      expect(fake.environmentCalls[2]?.GH_TOKEN).toBe("secret");
       expect(fake.environmentCalls.at(-1)?.GH_TOKEN).toBeUndefined();
       expect(fake.environmentCalls.at(-1)?.GITHUB_TOKEN).toBeUndefined();
       expect(fake.environmentCalls.at(-1)?.GIT_CONFIG_VALUE_0).toBeUndefined();

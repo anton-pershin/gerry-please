@@ -26,7 +26,7 @@ Rules are data, not executable code. Event, actions, and repository filters are 
 
 ## Queue and ownership
 
-Workers claim queued/retry-waiting runs in creation order using a transaction and a lease owner. Runs in one conversation or workflow cannot execute concurrently. Waiting/completed/quarantined workflows are filtered in SQL, so blocked backlogs do not starve unrelated runs. Independent fresh runs, conversations, and workflow instances can execute up to the configured worker count.
+Workers claim queued/retry-waiting runs in creation order using a transaction and a lease owner. Runs in one conversation or workflow cannot execute concurrently. Waiting/closed/completed/quarantined workflows are filtered in SQL, so blocked backlogs do not starve unrelated runs. Independent fresh runs, conversations, and workflow instances can execute up to the configured worker count.
 
 Only one Gerry daemon can serve a data directory. `serve.lock` rejects a second live daemon, while CLI inspection/retry commands remain available. Leases and heartbeats track ownership, and completion/failure/session/workspace mutations check that ownership before follow-on writes.
 
@@ -56,7 +56,7 @@ A hidden `<!-- gerry:run=... -->` comment marker links a newly triggered run to 
 
 A rule with `workflow_start: true` creates or finds a workflow for its origin issue. Resume rules find an existing instance by origin issue or PR head branch; they never create one implicitly. The workflow ID determines its worktree and `gerry/<workflow-id>` branch, so an implementer opening a PR from that branch creates a durable issue-to-PR link.
 
-Every matching review turn resumes the same compatibility-checked agent session and workspace. Independent workflow IDs have no shared execution lock, permitting parallel implementations. An approving PR review marks the workflow completed without invoking another agent turn.
+Every matching review turn resumes the same compatibility-checked agent session and workspace. Reviewer dispatch uses the native `pull_request.ready_for_review` readiness signal rather than PR creation or every push: implementers keep CI-dependent revisions draft and mark them ready only after checks pass. Independent workflow IDs have no shared execution lock, permitting parallel implementations. An approving PR review leaves the workflow active so follow-up turns can still run. Only a merged PR marks it completed; closing without merging marks it closed, and reopening reactivates it. An operator can instead abandon a closed-unmerged workflow with no active run: its history and artifacts remain, while a later approval creates a replacement workflow ID. SQLite permits multiple abandoned workflows per origin but only one non-abandoned workflow.
 
 Workflow failures use the same conservative semantics as conversations: ambiguous failures retain ledgers and quarantine only the affected workflow. Retry/resolution is quarantine-owner checked and cannot clear a newer run’s quarantine.
 
@@ -66,7 +66,9 @@ Workflow agents do not receive cross-repository credentials. During an active ru
 
 Requests are unique by `(workflow, requestKey)`. Existing completed requests return the same issue; an ambiguous creation state fails closed instead of creating a duplicate. A successful request records the dependency and moves the parent to `waiting`, blocking its queued turns without consuming workers.
 
-Issue closure and PR merges are tracked independently so webhook order does not matter. Only merges into the configured default branch are eligible. Each merge observation is preserved, and resolution occurs only after GitHub’s issue timeline confirms a closed event whose commit ID equals the observed PR merge commit. Closing keywords, timestamps, `not_planned` closures, non-default-branch merges, or merge without closure cannot resolve the dependency.
+An optional dependency-discussion policy creates a narrow exception for `@implementer` issue comments. Those durable runs reuse the requesting implementer's session and worktree but have an explicit `allow_waiting` flag, so the parent stays `waiting` and implementation remains paused. Replies and full issue-body replacements use capability-checked broker endpoints rather than cross-repository agent credentials. Body updates replace the complete text, preserve the canonical dependency marker, and require the four SDD issue sections. `ready-for-human-approval` and `approved` labels block both new discussion runs and broker comments; removing the readiness label reopens discussion without granting implementation approval. Dependency status, parent status, issue state, and labels are revalidated immediately before runtime startup and again before a broker reply, including a second local-state check after each GitHub lookup.
+
+Issue closure and PR merges are tracked independently so webhook order does not matter. Only merges into the configured default branch are eligible. Each merge observation is preserved. Resolution normally requires a timeline closed event whose commit ID equals the PR merge commit. Squash merges with a null commit ID instead require the PR’s merged actor and closing keyword, plus an issue close by that same actor within five minutes. Closing keywords or timestamps alone, `not_planned` closures, non-default-branch merges, mismatched commit IDs, or merge without closure cannot resolve the dependency.
 
 The parent resumes only when every dependency in its current cycle is resolved or explicitly abandoned. A per-workflow/per-cycle internal delivery carries dependency issue/PR/merge-SHA context and reactivates the same workflow. Cycle-scoped idempotency prevents historical dependencies from suppressing later wait/resume rounds. Startup and periodic recovery retry verification and incomplete resume dispatch idempotently.
 
@@ -88,7 +90,7 @@ Runtime-specific dependencies are confined to `src/runtimes/`. Queue, rules, per
 
 ### OpenCode
 
-The adapter uses `@opencode/client` and can discover the local V2 background service or connect to an explicit URL. Prompt submission is durable admission, not completion; the adapter waits for event-stream readiness, subscribes to session events, fails closed on disconnect, and waits for idle. It rejects permission requests, fetches final session/message snapshots (the durable response is authoritative), and removes GitHub token values from the session shell environment afterward. Interruption, subscription cleanup, and credential cleanup all have deadlines.
+The adapter uses `@opencode/client` and can discover the local V2 background service or connect to an explicit URL. Prompt submission is durable admission, not completion; the adapter waits for event-stream readiness, subscribes to session events, fails closed on disconnect, and waits for idle. OpenCode resets the injected session environment between tool calls, so the adapter reapplies the complete run environment on every `session.tool.called` event and fails closed if a refresh fails. It rejects permission requests, fetches final session/message snapshots (the durable response is authoritative), and removes GitHub token values from the session shell environment afterward. Interruption, subscription cleanup, and credential cleanup all have deadlines.
 
 OpenCode event streams are live-only. Snapshots supplement them but are not a substitute for retaining the local run files during disconnects.
 

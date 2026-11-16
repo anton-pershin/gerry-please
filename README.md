@@ -11,7 +11,7 @@ There is no GUI. YAML configures the system, SQLite makes execution durable, and
 - Starts one agent per matching rule using a rendered Markdown prompt.
 - Supports fresh sessions, persistent issue/PR discussions, and workflow-scoped sessions spanning an approved issue and its PR review rounds.
 - Runs independent implementation workflows in parallel while serializing turns within each workflow and applying per-workflow turn budgets.
-- Links PRs to workflows by head branch and completes workflows on an approving review.
+- Links PRs to workflows by head branch, keeps them active after approval, and completes them when the PR merges.
 - Supports allowlisted cross-repository dependencies: an implementer can request an issue in another repository, wait, and resume after that issue closes through its linked PR merge.
 - Serializes each discussion and applies a shared turn budget across participating agents to stop comment loops.
 - Gives coding agents dedicated Git worktrees and branches; preserves them after failure for inspection.
@@ -108,6 +108,7 @@ For the example workflow, grant:
 | Contents | Read & write | Fetch, commit, and push implementation branches |
 | Issues | Read & write | Read/comment on issues and apply labels |
 | Pull requests | Read & write | Read discussions and create PRs |
+| Checks | Read | Wait for PR checks before marking implementation PRs ready |
 
 Subscribe to **Issues**, **Issue comments**, **Pull requests**, **Pull request reviews**, and **Pull request review comments** for the complete example. Set the webhook URL to:
 
@@ -137,9 +138,9 @@ Run one Gerry process per data directory. SQLite WAL protects database access, b
 2. The maintainer comments and applies `approved` when requirements are actionable.
 3. The label event triggers `implement-approved-issue` once for that issue.
 4. A fresh Hermes session receives a dedicated worktree and `gerry/<run-id>` branch.
-5. The implementer writes `specs/issue-<n>.md`, implements and tests it, pushes the branch, and opens a PR.
-6. Gerry associates the PR head branch with the same workflow. Review comments resume the same implementer session and worktree, rather than starting over.
-7. Independent issues create independent workflow instances that can run in parallel. An approving review completes the workflow; no stop prompt is needed.
+5. The implementer writes `specs/issue-<n>.md`, implements and tests it, pushes the branch, and opens a draft PR. It waits for CI on the exact head, fixes failures while still draft, and marks the PR ready only after relevant local checks and CI pass.
+6. The `ready_for_review` event triggers the reviewer; opening or pushing an unfinished PR does not. Gerry associates the PR head branch with the same workflow, and review comments resume the same implementer session and worktree. Before pushing an unfinished review revision, the implementer converts the PR back to draft and repeats the CI gate.
+7. Independent issues create independent workflow instances that can run in parallel. An approving review leaves the workflow active for follow-up turns. Merging the PR completes it; closing it without merging marks it closed.
 
 The rule engine does not parse an agent’s natural-language response to infer `approved`; the GitHub label is the explicit handoff.
 
@@ -153,7 +154,7 @@ The example dependency policy allows `your-org/your-repo` to request work in `yo
 4. Gerry records the dependency issue closure and every linked PR merge observation. It resolves only after GitHub’s issue timeline confirms that the issue’s closed event references the same merge commit from a default-branch PR; closing keywords alone are insufficient.
 5. Once **all** dependencies resolve, Gerry queues one internal resume delivery with the dependency issue, merged PR, and merge SHA as context. The same parent session/worktree continues.
 
-Requests are idempotent by `(workflow, requestKey)`, and startup recovery retries unresolved resume dispatch.
+Requests are idempotent by `(workflow, requestKey)`, and startup recovery retries unresolved resume dispatch. If a merged dependency leaves a distinct gap, the same workflow can request a focused follow-up with a new stable request key in the next cycle.
 
 ### Two agents discussing an issue or PR
 
@@ -190,6 +191,9 @@ bun run src/cli.ts runs cancel run_...
 # After reconciling an ambiguous failure, release its ledger/conversation quarantine
 # without executing another attempt (the run remains marked failed/interrupted)
 bun run src/cli.ts runs resolve run_...
+
+# Archive a closed-unmerged workflow and allow a fresh implementation on reapproval
+bun run src/cli.ts workflows abandon wf_...
 
 # Why a delivery did or did not dispatch
 bun run src/cli.ts deliveries show DELIVERY_UUID

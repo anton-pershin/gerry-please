@@ -51,6 +51,7 @@ interface EnqueueInput {
   parentRunId: string | null;
   workflowId?: string;
   resumeWorkflow?: boolean;
+  allowWaiting?: boolean;
 }
 
 interface ConversationRow {
@@ -77,6 +78,7 @@ interface RunRow {
   workflow_type: string | null;
   session_policy: "fresh" | "conversation" | "workflow";
   once_per_subject: number;
+  allow_waiting: number;
   status: RunStatus;
   attempt: number;
   max_attempts: number;
@@ -160,6 +162,7 @@ export class Store {
         workflow_type TEXT,
         session_policy TEXT NOT NULL,
         once_per_subject INTEGER NOT NULL DEFAULT 0,
+        allow_waiting INTEGER NOT NULL DEFAULT 0,
         status TEXT NOT NULL,
         attempt INTEGER NOT NULL DEFAULT 0,
         max_attempts INTEGER NOT NULL,
@@ -234,8 +237,7 @@ export class Store {
         quarantine_reason TEXT,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
-        completed_at INTEGER,
-        UNIQUE(type, repository, origin_subject_type, origin_subject_number)
+        completed_at INTEGER
       );
       CREATE UNIQUE INDEX IF NOT EXISTS workflows_branch_idx ON workflows(branch) WHERE branch IS NOT NULL;
       CREATE INDEX IF NOT EXISTS workflows_pr_idx ON workflows(repository, pull_request_number);
@@ -305,10 +307,66 @@ export class Store {
     this.ensureColumn("runs", "workflow_type", "TEXT");
     this.ensureColumn("runs", "agent_capability_hash", "TEXT");
     this.ensureColumn("runs", "rule_snapshot", "TEXT");
+    this.ensureColumn("runs", "allow_waiting", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("workflows", "dependency_cycle", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("dependencies", "cycle", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("dependencies", "resume_dispatched_at", "INTEGER");
+    this.rebuildWorkflowOriginConstraint();
     this.db.exec("CREATE INDEX IF NOT EXISTS runs_workflow_idx ON runs(workflow_id, status)");
+    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS workflows_branch_idx ON workflows(branch) WHERE branch IS NOT NULL");
+    this.db.exec("CREATE INDEX IF NOT EXISTS workflows_pr_idx ON workflows(repository, pull_request_number)");
+    this.db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS workflows_origin_current_idx ON workflows
+      (type, repository, origin_subject_type, origin_subject_number) WHERE status != 'abandoned'`);
+  }
+
+  private rebuildWorkflowOriginConstraint(): void {
+    const indexes = this.db.query("PRAGMA index_list(workflows)").all() as Array<{ name: string; unique: number }>;
+    const legacy = indexes.some((index) => {
+      if (index.unique !== 1 || !index.name.startsWith("sqlite_autoindex_")) return false;
+      const columns = this.db.query(`PRAGMA index_info(${index.name})`).all() as Array<{ name: string }>;
+      return columns.map((column) => column.name).join(",") === "type,repository,origin_subject_type,origin_subject_number";
+    });
+    if (!legacy) return;
+
+    this.db.exec("PRAGMA foreign_keys = OFF");
+    try {
+      this.db.transaction(() => {
+        this.db.exec(`CREATE TABLE workflows_restart (
+          id TEXT PRIMARY KEY,
+          type TEXT NOT NULL,
+          repository TEXT NOT NULL,
+          installation_id INTEGER NOT NULL,
+          origin_subject_type TEXT NOT NULL,
+          origin_subject_number INTEGER NOT NULL,
+          status TEXT NOT NULL,
+          workspace_path TEXT,
+          branch TEXT,
+          pull_request_number INTEGER,
+          pull_request_url TEXT,
+          turns INTEGER NOT NULL DEFAULT 0,
+          dependency_cycle INTEGER NOT NULL DEFAULT 0,
+          quarantined INTEGER NOT NULL DEFAULT 0,
+          quarantine_run_id TEXT,
+          quarantine_reason TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          completed_at INTEGER
+        )`);
+        this.db.exec(`INSERT INTO workflows_restart
+          SELECT id, type, repository, installation_id, origin_subject_type, origin_subject_number, status,
+            workspace_path, branch, pull_request_number, pull_request_url, turns, dependency_cycle,
+            quarantined, quarantine_run_id, quarantine_reason, created_at, updated_at, completed_at
+          FROM workflows`);
+        this.db.exec("DROP TABLE workflows");
+        this.db.exec("ALTER TABLE workflows_restart RENAME TO workflows");
+      })();
+      this.db.exec("PRAGMA foreign_keys = ON");
+    } catch (error) {
+      this.db.exec("PRAGMA foreign_keys = ON");
+      throw error;
+    }
+    const violations = this.db.query("PRAGMA foreign_key_check").all();
+    if (violations.length > 0) throw new Error("Workflow migration produced foreign-key violations");
   }
 
   private ensureColumn(table: string, column: string, definition: string): void {
@@ -414,7 +472,8 @@ export class Store {
 
   private findWorkflowByOrigin(type: string, repository: string, issueNumber: number): WorkflowRecord | null {
     const row = this.db.query(`SELECT * FROM workflows
-      WHERE type = ? AND repository = ? AND origin_subject_type = 'issue' AND origin_subject_number = ?`)
+      WHERE type = ? AND repository = ? AND origin_subject_type = 'issue' AND origin_subject_number = ?
+        AND status != 'abandoned'`)
       .get(type, repository, issueNumber) as Record<string, unknown> | null;
     return row ? this.mapWorkflow(row) : null;
   }
@@ -424,7 +483,13 @@ export class Store {
       return this.findWorkflowByOrigin(type, context.repository, context.subject.number);
     }
     const pullRequest = context.payload.pull_request as Record<string, unknown> | undefined;
-    const head = pullRequest?.head as Record<string, unknown> | undefined;
+    if (!pullRequest) {
+      const row = this.db.query(`SELECT id FROM workflows
+        WHERE type = ? AND repository = ? AND pull_request_number = ?`)
+        .get(type, context.repository, context.subject.number) as { id: string } | null;
+      return row ? this.getWorkflow(row.id) : null;
+    }
+    const head = pullRequest.head as Record<string, unknown> | undefined;
     const branch = typeof head?.ref === "string" ? head.ref : null;
     if (branch) {
       const row = this.db.query("SELECT * FROM workflows WHERE branch = ? AND repository = ?")
@@ -515,8 +580,11 @@ export class Store {
         if (!workflowId) return skip("No matching workflow was found for this event");
         const workflow = this.getWorkflow(workflowId);
         if (workflow.type !== workflowType) return skip(`Workflow type mismatch: expected ${workflowType}, found ${workflow.type}`);
-        if (!input.resumeWorkflow && workflow.status !== "active") return skip(`Workflow is ${workflow.status}`);
-        if (workflow.status === "completed") return skip("Workflow is completed");
+        const discussionWhileWaiting = input.allowWaiting === true && workflow.status === "waiting";
+        if (!input.resumeWorkflow && workflow.status !== "active" && !discussionWhileWaiting) {
+          return skip(`Workflow is ${workflow.status}`);
+        }
+        if (workflow.status === "completed" || workflow.status === "closed") return skip(`Workflow is ${workflow.status}`);
         if (workflow.turns >= rule.max_turns) return skip(`Workflow turn limit reached (${rule.max_turns})`);
         if (input.resumeWorkflow) {
           this.db.query("UPDATE workflows SET status = 'active', updated_at = ? WHERE id = ?").run(now(), workflowId);
@@ -555,12 +623,12 @@ export class Store {
         .query(`INSERT INTO runs (
           id, delivery_id, rule_name, rule_snapshot, agent_name, runtime_name, runtime_type, repository, installation_id,
           subject_type, subject_number, conversation_key, workflow_id, workflow_type, session_policy,
-          once_per_subject, status, max_attempts, available_at, parent_run_id, config_hash,
+          once_per_subject, allow_waiting, status, max_attempts, available_at, parent_run_id, config_hash,
           prompt_path, prompt_hash, prompt_snapshot, instructions_snapshot, retry_backoff_seconds, created_at
         ) VALUES (
           $id, $deliveryId, $ruleName, $ruleSnapshot, $agentName, $runtimeName, $runtimeType, $repository, $installationId,
           $subjectType, $subjectNumber, $conversationKey, $workflowId, $workflowType, $sessionPolicy,
-          $oncePerSubject, 'queued', $maxAttempts, $availableAt, $parentRunId, $configHash,
+          $oncePerSubject, $allowWaiting, 'queued', $maxAttempts, $availableAt, $parentRunId, $configHash,
           $promptPath, $promptHash, $promptSnapshot, $instructionsSnapshot, $retryBackoffSeconds, $createdAt
         )`)
         .run({
@@ -580,6 +648,7 @@ export class Store {
           $workflowType: workflowType,
           $sessionPolicy: rule.session,
           $oncePerSubject: rule.once_per_subject ? 1 : 0,
+          $allowWaiting: input.allowWaiting === true ? 1 : 0,
           $maxAttempts: input.agent.max_attempts,
           $availableAt: timestamp,
           $parentRunId: input.parentRunId,
@@ -622,6 +691,7 @@ export class Store {
       workflowType: row.workflow_type,
       sessionPolicy: row.session_policy,
       oncePerSubject: row.once_per_subject === 1,
+      allowWaiting: row.allow_waiting === 1,
       status: row.status,
       attempt: row.attempt,
       maxAttempts: row.max_attempts,
@@ -703,7 +773,8 @@ export class Store {
                 EXISTS (
                   SELECT 1 FROM workflows AS workflow
                   WHERE workflow.id = candidate.workflow_id
-                    AND workflow.status = 'active' AND workflow.quarantined = 0
+                    AND (workflow.status = 'active' OR (workflow.status = 'waiting' AND candidate.allow_waiting = 1))
+                    AND workflow.quarantined = 0
                 )
                 AND NOT EXISTS (
                   SELECT 1 FROM runs AS active_workflow_run
@@ -932,6 +1003,18 @@ export class Store {
     this.db.query("DELETE FROM rule_ledger WHERE run_id = ?").run(runId);
   }
 
+  skipClaimed(runId: string, workerId: string, reason: string): RunRecord {
+    return this.db.transaction(() => {
+      const update = this.db
+        .query(`UPDATE runs SET status = 'cancelled', finished_at = ?, last_error = ?, lease_owner = NULL,
+          lease_expires_at = NULL, agent_capability_hash = NULL WHERE id = ? AND lease_owner = ? AND status = 'preparing'`)
+        .run(now(), reason, runId, workerId);
+      if (update.changes !== 1) throw new Error(`Run ownership was lost while skipping ${runId}`);
+      this.releaseLedger(runId);
+      return this.getRun(runId);
+    })();
+  }
+
   cancel(runId: string): RunRecord {
     return this.db.transaction(() => {
       const run = this.getRun(runId);
@@ -1024,6 +1107,22 @@ export class Store {
     })();
   }
 
+  abandonWorkflow(workflowId: string): WorkflowRecord {
+    return this.db.transaction(() => {
+      const workflow = this.getWorkflow(workflowId);
+      if (workflow.status !== "closed") throw new Error(`Only closed-unmerged workflows can be abandoned; ${workflowId} is ${workflow.status}`);
+      const active = this.db.query(`SELECT 1 FROM runs
+        WHERE workflow_id = ? AND status IN ('preparing', 'running') LIMIT 1`).get(workflowId);
+      if (active) throw new Error(`Cannot abandon ${workflowId} while a run is active`);
+      const timestamp = now();
+      const update = this.db.query(`UPDATE workflows SET status = 'abandoned', completed_at = NULL, updated_at = ?
+        WHERE id = ? AND status = 'closed'`).run(timestamp, workflowId);
+      if (update.changes !== 1) throw new Error(`Workflow status changed while abandoning ${workflowId}`);
+      this.db.query("DELETE FROM rule_ledger WHERE run_id IN (SELECT id FROM runs WHERE workflow_id = ?)").run(workflowId);
+      return this.getWorkflow(workflowId);
+    })();
+  }
+
   activateWorkflowForResume(workflowId: string): void {
     this.db.query("UPDATE workflows SET status = 'active', updated_at = ? WHERE id = ? AND status = 'waiting'")
       .run(now(), workflowId);
@@ -1042,12 +1141,18 @@ export class Store {
     const url = typeof pullRequest.html_url === "string" ? pullRequest.html_url : null;
     this.db.query("UPDATE workflows SET pull_request_number = ?, pull_request_url = ?, updated_at = ? WHERE id = ?")
       .run(number, url, now(), row.id);
-    if (context.event === "pull_request_review" && context.action === "submitted") {
-      const review = context.payload.review as Record<string, unknown> | undefined;
-      if (review?.state === "approved") {
+    if (context.event === "pull_request" && context.action === "closed") {
+      const timestamp = now();
+      if (pullRequest.merged === true) {
         this.db.query("UPDATE workflows SET status = 'completed', completed_at = ?, updated_at = ? WHERE id = ? AND status IN ('active', 'waiting')")
-          .run(now(), now(), row.id);
+          .run(timestamp, timestamp, row.id);
+      } else {
+        this.db.query("UPDATE workflows SET status = 'closed', completed_at = NULL, updated_at = ? WHERE id = ? AND status IN ('active', 'waiting')")
+          .run(timestamp, row.id);
       }
+    } else if (context.event === "pull_request" && context.action === "reopened") {
+      this.db.query("UPDATE workflows SET status = 'active', updated_at = ? WHERE id = ? AND status = 'closed'")
+        .run(now(), row.id);
     }
     return this.getWorkflow(row.id);
   }
@@ -1083,6 +1188,14 @@ export class Store {
     const row = this.db.query("SELECT * FROM dependencies WHERE id = ?").get(dependencyId) as Record<string, unknown> | null;
     if (!row) throw new Error(`Dependency not found: ${dependencyId}`);
     return this.mapDependency(row);
+  }
+
+  findPendingDependencyForIssue(repository: string, issueNumber: number): DependencyRecord | null {
+    const rows = this.db.query(`SELECT id FROM dependencies
+      WHERE target_repository = ? AND target_issue_number = ? AND status = 'pending'
+      ORDER BY created_at DESC LIMIT 2`).all(repository, issueNumber) as Array<{ id: string }>;
+    if (rows.length > 1) throw new Error(`Multiple pending dependencies reference ${repository}#${issueNumber}`);
+    return rows[0] ? this.getDependency(rows[0].id) : null;
   }
 
   listDependencies(limit = 100): DependencyRecord[] {

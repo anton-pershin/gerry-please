@@ -12,7 +12,11 @@ import { compactError, errorMessage, id, sleep, stableStringify, withDeadline } 
 import { WorkspaceManager } from "./workspace.ts";
 
 export interface TokenProvider {
-  get(installationId: number, repositoryFullName: string): Promise<string>;
+  get(installationId: number, repositoryFullName: string, minimumLifetimeMs?: number): Promise<string>;
+}
+
+export interface RunGate {
+  check(run: RunRecord): Promise<{ allowed: true } | { allowed: false; reason: string }>;
 }
 
 export interface WorkerPoolOptions {
@@ -22,6 +26,7 @@ export interface WorkerPoolOptions {
   tokens: TokenProvider;
   logger: Logger;
   workspace?: WorkspaceManager;
+  runGate?: RunGate;
 }
 
 const QUOTA_INITIAL_RETRY_DELAY_MS = 5 * 60 * 1000;
@@ -32,6 +37,23 @@ function quotaRetryDelayMs(attempt: number): number {
   return Math.min(QUOTA_MAX_RETRY_DELAY_MS, QUOTA_INITIAL_RETRY_DELAY_MS * 2 ** exponent);
 }
 
+function dependencyInstructions(targets: string[]): string {
+  if (targets.length === 0) {
+    return "No cross-repository dependency requests are allowed for this workflow. Do not create issues in other repositories, including upstream third-party libraries. " +
+      "If a required change is outside the configured policy, stop and explain what configuration change is required.";
+  }
+  const list = targets.map((target) => `- \`${target}\``).join("\n");
+  return `Cross-repository dependency requests are allowed only for:\n${list}\n` +
+    "Do not request changes in any other repository, including upstream third-party libraries. If a required change is outside this list, stop and explain instead of creating an issue. " +
+    "Only request changes needed to unblock the approved task; do not delegate the task itself. " +
+    "If you need functionality from another repository, do not use GH_TOKEN for cross-repository access. " +
+    "Instead, send a JSON POST to $GERRY_DEPENDENCY_URL with header `Authorization: Bearer $GERRY_AGENT_TOKEN`. " +
+    "The JSON fields are `to`, `title`, `body`, and `requestKey`. Use a stable descriptive requestKey so retries are idempotent. " +
+    "The broker returns the dependency issue URL only when the repository policy allows it. After requesting a required dependency, " +
+    "summarize it and end your turn; the same workflow will resume after the dependency issue closes and its linked PR merges. " +
+    "If a resolved dependency leaves a distinct remaining gap, request that gap with a new stable requestKey instead of repeating the resolved request.";
+}
+
 function buildPrompt(input: {
   instructions: string;
   task: string;
@@ -40,6 +62,7 @@ function buildPrompt(input: {
   workspacePath: string;
   branch: string | null;
   contextPath: string;
+  dependencyTargets: string[];
 }): string {
   const subject = `${input.context.subject.type} #${input.context.subject.number}`;
   return `${input.instructions ? `# Agent instructions\n\n${input.instructions}\n\n` : ""}# Task\n\n${input.task}\n\n# Execution contract\n\n` +
@@ -57,11 +80,7 @@ function buildPrompt(input: {
     `When writing a GitHub issue comment, PR comment, or review, append the hidden lineage marker ` +
     `\`<!-- gerry:run=${input.run.id} -->\` on its own line. ` +
     `If the task needs an operation outside your configured permissions, stop and explain what configuration change is required.` +
-    `${input.run.workflowId ? `\n\nIf you need functionality from another repository, do not use GH_TOKEN for cross-repository access. ` +
-      `Instead, send a JSON POST to $GERRY_DEPENDENCY_URL with header \`Authorization: Bearer $GERRY_AGENT_TOKEN\`. ` +
-      `The JSON fields are \`to\`, \`title\`, \`body\`, and \`requestKey\`. Use a stable descriptive requestKey so retries are idempotent. ` +
-      `The broker returns the dependency issue URL only when the repository policy allows it. After requesting a required dependency, ` +
-      `summarize it and end your turn; the same workflow will resume after the dependency issue closes and its linked PR merges.` : ""}`;
+    `${input.run.workflowId ? `\n\n${dependencyInstructions(input.dependencyTargets)}` : ""}`;
 }
 
 export class WorkerPool {
@@ -149,7 +168,7 @@ export class WorkerPool {
       if (run.configHash !== config.hash) throw new Error("Configuration changed after this run was queued; create a new delivery or retry with the original config");
 
       token = await withDeadline(
-        this.options.tokens.get(run.installationId, run.repository),
+        this.options.tokens.get(run.installationId, run.repository, agent.timeout_seconds * 1000 + 60_000),
         30_000,
         "GitHub installation token acquisition timed out",
       );
@@ -189,6 +208,9 @@ export class WorkerPool {
         workspacePath: workspace.workspacePath,
         branch: workspace.branch,
         contextPath,
+        dependencyTargets: [...new Set(config.dependencies
+          .filter((dependency) => dependency.from === run.repository && dependency.allow_issue_creation)
+          .map((dependency) => dependency.to))].sort(),
       });
       atomicWrite(join(runDirectory, "prompt.md"), prompt);
 
@@ -208,12 +230,27 @@ export class WorkerPool {
         environment.GERRY_DEPENDENCY_URL = `http://${brokerHost}:${config.server.port}/agent/dependencies`;
         environment.GERRY_AGENT_TOKEN = capability;
         store.setAgentCapability(run.id, createHash("sha256").update(capability).digest("hex"), workerId);
+        recorder.emit({
+          type: "runtime.broker_environment",
+          data: {
+            url: environment.GERRY_DEPENDENCY_URL ?? null,
+            capabilityConfigured: Boolean(environment.GERRY_AGENT_TOKEN),
+          },
+        });
       }
       const existingRuntimeSessionId = run.runtimeSessionId ?? (run.workflowId
         ? store.getWorkflowSession(run.workflowId, run.agentName, run.runtimeName, sessionCompatibilityHash)
         : run.conversationKey
           ? store.getConversationSession(run.conversationKey, run.agentName, run.runtimeName, sessionCompatibilityHash)
           : null);
+      if (this.options.runGate) {
+        const gate = await this.options.runGate.check(run);
+        if (!gate.allowed) {
+          const skipped = store.skipClaimed(run.id, workerId, gate.reason);
+          logger.info("run.skipped", { runId: run.id, attempt: run.attempt, rule: run.ruleName, reason: gate.reason, status: skipped.status });
+          return;
+        }
+      }
       store.markRunning(run.id, workerId);
       runtimeStarted = true;
       const result = await runtime.run({

@@ -4,6 +4,11 @@ Requirements supplied by the author:
 
 {{issue.body}}
 
-Give a clear recommendation of `READY FOR HUMAN APPROVAL` or `NOT READY`. If not ready, ask the specific questions needed to make it ready.
+Assess whether the issue deserves being implemented.
 
-Do not apply the `approved` label or any other approval marker. The human maintainer will decide whether to apply `approved` manually.
+Leave the issue comment with your opinion. If you are satisfied with this issue, apply the `ready-for-human-approval` label with `gh issue edit {{issue.number}} --add-label ready-for-human-approval`. If the issue is not ready, ask the specific questions needed to make it ready or reject the issue completely by applying the `rejected` label.
+
+For a broker-created dependency issue (its body contains `gerry:dependency=`):
+- If clarification or changes are needed, ask specific questions with `@implementer`.
+
+Never apply `approved` yourself. The human maintainer will decide whether to apply it manually.

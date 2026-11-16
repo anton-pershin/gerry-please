@@ -48,6 +48,7 @@ export interface RunRecord {
   workflowType: string | null;
   sessionPolicy: "fresh" | "conversation" | "workflow";
   oncePerSubject: boolean;
+  allowWaiting: boolean;
   status: RunStatus;
   attempt: number;
   maxAttempts: number;
@@ -72,7 +73,7 @@ export interface RunRecord {
   usage: JsonObject | null;
 }
 
-export type WorkflowStatus = "active" | "waiting" | "completed";
+export type WorkflowStatus = "active" | "waiting" | "closed" | "completed" | "abandoned";
 
 export interface WorkflowRecord {
   id: string;

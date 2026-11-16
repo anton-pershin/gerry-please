@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { Condition } from "../src/config.ts";
+import { loadConfig } from "../src/config.ts";
 import { buildContext, evaluateCondition, parentRunFromPayload, renderTemplate, ruleMatches } from "../src/rules.ts";
 import { configFixture, context, issuePayload } from "./helpers.ts";
 
@@ -25,6 +26,23 @@ describe("rule conditions", () => {
     expect(ruleMatches(rule, context())).toBe(true);
     expect(ruleMatches(rule, context(issuePayload("edited")))).toBe(false);
     expect(ruleMatches({ ...rule, repositories: ["other/repo"] }, context())).toBe(false);
+  });
+
+  test("reviews only PRs explicitly marked ready in the example workflow", () => {
+    const config = loadConfig(new URL("../gerry.example.yaml", import.meta.url).pathname);
+    const rule = config.rules.find((candidate) => candidate.name === "review-ready-pr")!;
+    const payload = issuePayload();
+    payload.pull_request = { number: 42, title: "Implementation" };
+    const matches = (action: string) => ruleMatches(rule, buildContext({
+      deliveryId: `pr-${action}`,
+      event: "pull_request",
+      action,
+      payload: { ...payload, action },
+    }));
+
+    expect(matches("ready_for_review")).toBe(true);
+    expect(matches("opened")).toBe(false);
+    expect(matches("synchronize")).toBe(false);
   });
 
   test("distinguishes issue comments on pull requests", () => {

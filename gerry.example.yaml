@@ -99,6 +99,13 @@ rules:
     max_turns: 20
     once_per_subject: true
 
+  # Review only when the implementer marks a draft PR ready after CI passes.
+  - name: review-ready-pr
+    on: { event: pull_request, actions: [ready_for_review] }
+    agent: reviewer
+    prompt: examples/prompts/review-pr.md
+    session: fresh
+
   # Review rounds resume the same implementer session/worktree via the PR head branch.
   - name: address-inline-pr-review
     on: { event: pull_request_review_comment, actions: [created] }

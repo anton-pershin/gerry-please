@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentConfig, LoadedConfig } from "./config.ts";
+import type { MergeObservation } from "./store.ts";
 import { withDeadline } from "./util.ts";
 
 export function verifyWebhookSignature(payload: string, signature: string | null, secret: string): boolean {
@@ -33,6 +34,70 @@ export function loadGitHubSecrets(config: LoadedConfig, environment: NodeJS.Proc
   return { appId: appId!, privateKey: readFileSync(privateKeyPath!, "utf8"), webhookSecret: webhookSecret! };
 }
 
+const DEFAULT_MINIMUM_TOKEN_LIFETIME_MS = 5 * 60_000;
+
+export function hasSufficientTokenLifetime(expiresAt: number, minimumLifetimeMs = 0, timestamp = Date.now()): boolean {
+  return expiresAt - timestamp > Math.max(DEFAULT_MINIMUM_TOKEN_LIFETIME_MS, minimumLifetimeMs);
+}
+
+interface PullRequestClosureEvidence {
+  merged?: boolean;
+  merge_commit_sha?: string | null;
+  merged_at?: string | null;
+  merged_by?: { login?: string } | null;
+  base?: { ref?: string };
+  body?: string | null;
+}
+
+interface IssueClosureTimelineEvent {
+  event?: string;
+  commit_id?: string | null;
+  created_at?: string;
+  actor?: { login?: string } | null;
+}
+
+export function verifyPullRequestClosureEvidence(input: {
+  pullRequest: PullRequestClosureEvidence;
+  timeline: IssueClosureTimelineEvent[];
+  observation: MergeObservation;
+  issueNumber: number;
+  commitAssociationVerified?: boolean;
+}): boolean {
+  const { pullRequest, observation, timeline, issueNumber } = input;
+  const mergedAt = Date.parse(pullRequest.merged_at ?? "");
+  if (pullRequest.merged !== true) return false;
+  if (pullRequest.merge_commit_sha) {
+    if (pullRequest.merge_commit_sha !== observation.mergeCommitSha) return false;
+  } else if (input.commitAssociationVerified !== true) {
+    return false;
+  }
+  if (pullRequest.base?.ref !== observation.baseRef || !Number.isFinite(mergedAt)) return false;
+  if (Math.abs(mergedAt - observation.mergedAt) > 1000) return false;
+  if (typeof pullRequest.body !== "string") return false;
+  const closingPattern = new RegExp(`\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\s+#${issueNumber}\\b`, "i");
+  if (!closingPattern.test(pullRequest.body)) return false;
+
+  let squashCandidate = false;
+  let mismatchedCommit = false;
+  for (const event of timeline) {
+    if (event.event !== "closed") continue;
+    if (event.commit_id) {
+      if (event.commit_id === observation.mergeCommitSha) return true;
+      mismatchedCommit = true;
+      continue;
+    }
+    const closedAt = Date.parse(event.created_at ?? "");
+    const actor = event.actor?.login;
+    const merger = pullRequest.merged_by?.login;
+    const closeFollowsMerge = closedAt + 5000 >= mergedAt;
+    const closeWithinMergeWindow = closedAt <= mergedAt + 5 * 60_000;
+    if (Number.isFinite(closedAt) && closeFollowsMerge && closeWithinMergeWindow && actor && actor === merger) {
+      squashCandidate = true;
+    }
+  }
+  return squashCandidate && !mismatchedCommit;
+}
+
 export class GitHubAppTokens {
   private readonly app: App;
   private readonly cache = new Map<string, { token: string; expiresAt: number }>();
@@ -41,12 +106,12 @@ export class GitHubAppTokens {
     this.app = new App({ appId: secrets.appId, privateKey: secrets.privateKey });
   }
 
-  async get(installationId: number, repositoryFullName: string): Promise<string> {
+  async get(installationId: number, repositoryFullName: string, minimumLifetimeMs = 0): Promise<string> {
     const repositoryName = repositoryFullName.split("/")[1];
     if (!repositoryName) throw new Error(`Invalid repository full name: ${repositoryFullName}`);
     const cacheKey = `${installationId}:${repositoryFullName}`;
     const cached = this.cache.get(cacheKey);
-    if (cached && cached.expiresAt - Date.now() > 5 * 60_000) return cached.token;
+    if (cached && hasSufficientTokenLifetime(cached.expiresAt, minimumLifetimeMs)) return cached.token;
     const octokit = await this.app.getInstallationOctokit(installationId);
     const authentication = (await octokit.auth({
       type: "installation",
@@ -76,7 +141,7 @@ export class GitHubAppTokens {
     return this.get(installationId, repositoryFullName);
   }
 
-  async getIssue(repositoryFullName: string, issueNumber: number): Promise<{ number: number; url: string; body: string }> {
+  async getIssue(repositoryFullName: string, issueNumber: number): Promise<{ number: number; url: string; body: string; labels: string[]; state: string }> {
     const [owner, repository] = repositoryFullName.split("/");
     const token = await this.installationToken(repositoryFullName);
     const result = await withDeadline(fetch(
@@ -84,23 +149,55 @@ export class GitHubAppTokens {
       { headers: this.apiHeaders(token) },
     ), 30_000, "Dependency issue lookup timed out");
     if (!result.ok) throw new Error(`Dependency issue lookup failed with HTTP ${result.status}`);
-    const issue = await result.json() as { number?: number; html_url?: string; body?: string | null };
+    const issue = await result.json() as {
+      number?: number;
+      html_url?: string;
+      body?: string | null;
+      state?: string;
+      labels?: Array<{ name?: string } | string>;
+    };
     if (!issue.number || !issue.html_url) throw new Error("GitHub returned an incomplete issue response");
-    return { number: issue.number, url: issue.html_url, body: issue.body ?? "" };
+    const labels = (issue.labels ?? []).flatMap((label) => {
+      const name = typeof label === "string" ? label : label.name;
+      return name ? [name] : [];
+    });
+    return { number: issue.number, url: issue.html_url, body: issue.body ?? "", labels, state: issue.state ?? "open" };
   }
 
-  async verifyIssueClosedByPullRequest(repositoryFullName: string, issueNumber: number, mergeCommitSha: string): Promise<boolean> {
+  async verifyIssueClosedByPullRequest(repositoryFullName: string, issueNumber: number, observation: MergeObservation): Promise<boolean> {
     const [owner, repository] = repositoryFullName.split("/");
+    if (!owner || !repository) throw new Error(`Invalid repository full name: ${repositoryFullName}`);
     const token = await this.installationToken(repositoryFullName);
+    const pullRequestResult = await withDeadline(fetch(
+      `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/pulls/${observation.prNumber}`,
+      { headers: this.apiHeaders(token) },
+    ), 30_000, "Dependency pull request lookup timed out");
+    if (!pullRequestResult.ok) throw new Error(`Dependency pull request lookup failed with HTTP ${pullRequestResult.status}`);
+    const pullRequest = await pullRequestResult.json() as PullRequestClosureEvidence;
+    let commitAssociationVerified = false;
+    if (!pullRequest.merge_commit_sha) {
+      const associationResult = await withDeadline(fetch(
+        `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/commits/${encodeURIComponent(observation.mergeCommitSha)}/pulls`,
+        { headers: this.apiHeaders(token) },
+      ), 30_000, "Dependency merge-commit association lookup timed out");
+      if (!associationResult.ok) throw new Error(`Dependency merge-commit association lookup failed with HTTP ${associationResult.status}`);
+      const associated = await associationResult.json() as Array<{ number?: number; state?: string; merged_at?: string | null; base?: { ref?: string } }>;
+      commitAssociationVerified = associated.some((candidate) => {
+        const mergedAt = Date.parse(candidate.merged_at ?? "");
+        return candidate.number === observation.prNumber && candidate.state === "closed" &&
+          candidate.base?.ref === observation.baseRef && Number.isFinite(mergedAt) &&
+          Math.abs(mergedAt - observation.mergedAt) <= 1000;
+      });
+    }
     for (let page = 1; page <= 10; page += 1) {
       const result = await withDeadline(fetch(
-        `https://api.github.com/repos/${encodeURIComponent(owner!)}/${encodeURIComponent(repository!)}/issues/${issueNumber}/timeline?per_page=100&page=${page}`,
+        `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/issues/${issueNumber}/timeline?per_page=100&page=${page}`,
         { headers: this.apiHeaders(token) },
       ), 30_000, "Dependency timeline verification timed out");
       if (!result.ok) throw new Error(`Dependency timeline verification failed with HTTP ${result.status}`);
-      const events = await result.json() as Array<{ event?: string; commit_id?: string | null }>;
-      if (events.some((event) => event.event === "closed" && event.commit_id === mergeCommitSha)) return true;
-      if (events.length < 100) return false;
+      const timeline = await result.json() as IssueClosureTimelineEvent[];
+      if (verifyPullRequestClosureEvidence({ pullRequest, timeline, observation, issueNumber, commitAssociationVerified })) return true;
+      if (timeline.length < 100) return false;
     }
     return false;
   }
@@ -144,6 +241,42 @@ export class GitHubAppTokens {
       const details = (await result.text()).slice(0, 2000);
       throw new Error(`GitHub issue creation failed with HTTP ${result.status}: ${details}`);
     }
+    const issue = await result.json() as { number?: number; html_url?: string };
+    if (!issue.number || !issue.html_url) throw new Error("GitHub returned an incomplete issue response");
+    return { number: issue.number, url: issue.html_url };
+  }
+
+  async createIssueComment(repositoryFullName: string, issueNumber: number, body: string): Promise<{ id: number; url: string }> {
+    const [owner, repository] = repositoryFullName.split("/");
+    if (!owner || !repository) throw new Error(`Invalid repository full name: ${repositoryFullName}`);
+    const token = await this.installationToken(repositoryFullName);
+    const result = await withDeadline(fetch(
+      `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/issues/${issueNumber}/comments`,
+      {
+        method: "POST",
+        headers: { ...this.apiHeaders(token), "content-type": "application/json" },
+        body: JSON.stringify({ body }),
+      },
+    ), 30_000, "Dependency issue comment timed out");
+    if (!result.ok) throw new Error(`Dependency issue comment failed with HTTP ${result.status}`);
+    const comment = await result.json() as { id?: number; html_url?: string };
+    if (!comment.id || !comment.html_url) throw new Error("GitHub returned an incomplete comment response");
+    return { id: comment.id, url: comment.html_url };
+  }
+
+  async updateIssueBody(repositoryFullName: string, issueNumber: number, body: string): Promise<{ number: number; url: string }> {
+    const [owner, repository] = repositoryFullName.split("/");
+    if (!owner || !repository) throw new Error(`Invalid repository full name: ${repositoryFullName}`);
+    const token = await this.installationToken(repositoryFullName);
+    const result = await withDeadline(fetch(
+      `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/issues/${issueNumber}`,
+      {
+        method: "PATCH",
+        headers: { ...this.apiHeaders(token), "content-type": "application/json" },
+        body: JSON.stringify({ body }),
+      },
+    ), 30_000, "Dependency issue update timed out");
+    if (!result.ok) throw new Error(`Dependency issue update failed with HTTP ${result.status}`);
     const issue = await result.json() as { number?: number; html_url?: string };
     if (!issue.number || !issue.html_url) throw new Error("GitHub returned an incomplete issue response");
     return { number: issue.number, url: issue.html_url };
