@@ -14,6 +14,19 @@ export function workflowConfigFixture(withDependencies = false) {
   raw.agents.implementer.workspace = "worktree";
   raw.rules = [
     {
+      name: "investigate-issue",
+      on: { event: "issues", actions: ["labeled"] },
+      when: [{ path: "label.name", equals: "requires-investigation" }],
+      agent: "implementer",
+      prompt: "investigate.md",
+      session: "workflow",
+      workflow: "implementation",
+      workflow_start: true,
+      workflow_phase: "investigation",
+      max_turns: 20,
+      once_per_subject: true,
+    },
+    {
       name: "implement-approved-issue",
       on: { event: "issues", actions: ["labeled"] },
       when: [{ path: "label.name", equals: "approved" }],
@@ -22,8 +35,27 @@ export function workflowConfigFixture(withDependencies = false) {
       session: "workflow",
       workflow: "implementation",
       workflow_start: true,
+      workflow_phase: "implementation",
       max_turns: 20,
       once_per_subject: true,
+    },
+    {
+      name: "discuss-issue-investigation",
+      on: { event: "issue_comment", actions: ["created"] },
+      when: [
+        { path: "issue.pull_request", exists: false },
+        { path: "issue.body", not_contains: "gerry:dependency=" },
+        { path: "comment.body", contains: "@implementer", ignore_case: true },
+        { path: "sender.login", not_equals: "gerry-please[bot]" },
+      ],
+      agent: "implementer",
+      prompt: "investigation-discussion.md",
+      session: "workflow",
+      workflow: "implementation",
+      workflow_start: false,
+      workflow_phase: "investigation",
+      max_turns: 20,
+      once_per_subject: false,
     },
     {
       name: "address-pr-review",
@@ -53,6 +85,8 @@ export function workflowConfigFixture(withDependencies = false) {
       once_per_subject: false,
     },
   ];
+  writeFileSync(join(fixture.directory, "investigate.md"), "Investigate {{issue.title}} without implementation\n");
+  writeFileSync(join(fixture.directory, "investigation-discussion.md"), "Continue investigation: {{comment.body}}\n");
   writeFileSync(join(fixture.directory, "review.md"), "Address review on PR #{{pull_request.number}} in {{workflow.id}}\n");
   if (withDependencies) {
     raw.repositories["acme/library"] = { path: "library", default_branch: "main" };
@@ -80,11 +114,33 @@ export function workflowConfigFixture(withDependencies = false) {
   return { ...fixture, config: loadConfig(path) };
 }
 
-export function issueContext(number = 42, deliveryId = `issue-${number}`): WebhookContext {
+export function issueContext(number = 42, deliveryId = `issue-${number}`, label = "approved"): WebhookContext {
   const payload = issuePayload("labeled");
-  payload.label = { name: "approved" };
+  payload.label = { name: label };
   (payload.issue as Record<string, unknown>).number = number;
   return buildContext({ deliveryId, event: "issues", action: "labeled", payload });
+}
+
+export function issueConversationContext(input: {
+  number?: number;
+  deliveryId?: string;
+  body?: string;
+  issueBody?: string;
+  sender?: string;
+} = {}): WebhookContext {
+  const number = input.number ?? 42;
+  const payload = issuePayload("created");
+  const issue = payload.issue as Record<string, unknown>;
+  issue.number = number;
+  issue.body = input.issueBody ?? "Please add bounded retries";
+  payload.comment = { body: input.body ?? "@implementer please clarify the investigation" };
+  payload.sender = { login: input.sender ?? "alice" };
+  return buildContext({
+    deliveryId: input.deliveryId ?? `issue-${number}-comment`,
+    event: "issue_comment",
+    action: "created",
+    payload,
+  });
 }
 
 export function prContext(input: {

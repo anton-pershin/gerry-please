@@ -7,7 +7,15 @@ import { ruleMatches } from "../src/rules.ts";
 import { Store } from "../src/store.ts";
 import type { AgentRuntime, RuntimeRunInput } from "../src/types.ts";
 import { WorkerPool } from "../src/worker.ts";
-import { enqueueWorkflow, initializeOrigin, issueContext, prContext, prConversationContext, workflowConfigFixture } from "./workflow-helpers.ts";
+import {
+  enqueueWorkflow,
+  initializeOrigin,
+  issueContext,
+  issueConversationContext,
+  prContext,
+  prConversationContext,
+  workflowConfigFixture,
+} from "./workflow-helpers.ts";
 
 const directories: string[] = [];
 afterEach(() => {
@@ -21,6 +29,7 @@ describe("workflow-scoped execution", () => {
     const store = new Store(fixture.config.dataDir);
     const first = enqueueWorkflow(store, fixture, issueContext(42, "first-issue"), "implement-approved-issue");
     const firstWorkflow = store.getWorkflow(first.runId ? store.getRun(first.runId).workflowId! : "");
+    expect(firstWorkflow.phase).toBe("implementation");
     const review = prContext({ number: 100, branch: firstWorkflow.branch!, deliveryId: "first-review" });
     expect(store.linkWorkflowPullRequest(review)?.pullRequestNumber).toBe(100);
     const firstReview = enqueueWorkflow(store, fixture, review, "address-pr-review");
@@ -208,6 +217,7 @@ describe("workflow-scoped execution", () => {
     database.close();
 
     const store = new Store(fixture.config.dataDir);
+    expect(store.getWorkflow("wf_legacy").phase).toBe("implementation");
     expect(store.abandonWorkflow("wf_legacy").status).toBe("abandoned");
     const replacement = enqueueWorkflow(store, fixture, issueContext(42, "legacy-replacement"), "implement-approved-issue");
     expect(replacement.decision).toBe("queued");
@@ -297,6 +307,79 @@ describe("workflow-scoped execution", () => {
     });
     expect(store.linkWorkflowPullRequest(wrongRepository)).toBeNull();
     expect(store.getWorkflow(workflow.id).pullRequestNumber).toBe(100);
+    store.close();
+  });
+
+  test("runs investigation, tagged discussion, and approved implementation in one workflow", async () => {
+    const fixture = workflowConfigFixture();
+    directories.push(fixture.directory);
+    initializeOrigin(fixture.directory);
+    const store = new Store(fixture.config.dataDir);
+    const inputs: RuntimeRunInput[] = [];
+    const runtime: AgentRuntime = {
+      type: "hermes",
+      check: async () => {},
+      run: async (input) => {
+        inputs.push(input);
+        return { sessionId: "implementation-session", response: "done" };
+      },
+    };
+    const workers = new WorkerPool({
+      config: fixture.config,
+      store,
+      runtimes: new Map([["hermes", runtime]]),
+      tokens: { get: async () => "token" },
+      logger: new Logger(join(fixture.config.dataDir, "service.jsonl"), undefined, false),
+    });
+
+    const investigation = enqueueWorkflow(
+      store,
+      fixture,
+      issueContext(42, "investigation-start", "requires-investigation"),
+      "investigate-issue",
+    );
+    expect(investigation.decision).toBe("queued");
+    await workers.runNext("worker-1");
+    const investigationRun = store.getRun(investigation.runId!);
+    const workflow = store.getWorkflow(investigationRun.workflowId!);
+    expect(workflow.phase).toBe("investigation");
+    expect(inputs[0]!.prompt).toContain("Investigate Add retries without implementation");
+
+    const discussionRule = fixture.config.rules.find((candidate) => candidate.name === "discuss-issue-investigation")!;
+    expect(ruleMatches(discussionRule, issueConversationContext({ body: "Please continue without a tag" }))).toBe(false);
+    expect(ruleMatches(discussionRule, issueConversationContext({ sender: "gerry-please[bot]" }))).toBe(false);
+    expect(ruleMatches(discussionRule, issueConversationContext({ issueBody: "<!-- gerry:dependency=abc -->" }))).toBe(false);
+
+    const comment = issueConversationContext({ deliveryId: "investigation-comment" });
+    expect(ruleMatches(discussionRule, comment)).toBe(true);
+    const discussion = enqueueWorkflow(store, fixture, comment, discussionRule.name);
+    expect(discussion.decision).toBe("queued");
+    expect(store.getRun(discussion.runId!).workflowId).toBe(workflow.id);
+    await workers.runNext("worker-1");
+    expect(inputs[1]!.existingSessionId).toBe("implementation-session");
+    expect(inputs[1]!.prompt).toContain("Continue investigation: @implementer");
+
+    const approval = enqueueWorkflow(store, fixture, issueContext(42, "investigation-approved"), "implement-approved-issue");
+    expect(approval.decision).toBe("queued");
+    expect(store.getRun(approval.runId!).workflowId).toBe(workflow.id);
+    expect(store.getWorkflow(workflow.id).phase).toBe("implementation");
+    await workers.runNext("worker-1");
+    expect(inputs[2]!.existingSessionId).toBe("implementation-session");
+    expect(inputs[2]!.prompt).toContain("Handle Add retries");
+    expect(inputs.map((input) => input.workspacePath)).toEqual([
+      inputs[0]!.workspacePath,
+      inputs[0]!.workspacePath,
+      inputs[0]!.workspacePath,
+    ]);
+
+    const afterApproval = enqueueWorkflow(
+      store,
+      fixture,
+      issueConversationContext({ deliveryId: "investigation-comment-after-approval" }),
+      discussionRule.name,
+    );
+    expect(afterApproval.decision).toBe("skipped");
+    expect(afterApproval.reason).toContain("Workflow phase is implementation; expected investigation");
     store.close();
   });
 

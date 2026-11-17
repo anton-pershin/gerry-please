@@ -226,6 +226,7 @@ export class Store {
         origin_subject_type TEXT NOT NULL,
         origin_subject_number INTEGER NOT NULL,
         status TEXT NOT NULL,
+        phase TEXT NOT NULL DEFAULT 'implementation',
         workspace_path TEXT,
         branch TEXT,
         pull_request_number INTEGER,
@@ -309,6 +310,7 @@ export class Store {
     this.ensureColumn("runs", "rule_snapshot", "TEXT");
     this.ensureColumn("runs", "allow_waiting", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("workflows", "dependency_cycle", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("workflows", "phase", "TEXT NOT NULL DEFAULT 'implementation'");
     this.ensureColumn("dependencies", "cycle", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("dependencies", "resume_dispatched_at", "INTEGER");
     this.rebuildWorkflowOriginConstraint();
@@ -339,6 +341,7 @@ export class Store {
           origin_subject_type TEXT NOT NULL,
           origin_subject_number INTEGER NOT NULL,
           status TEXT NOT NULL,
+          phase TEXT NOT NULL DEFAULT 'implementation',
           workspace_path TEXT,
           branch TEXT,
           pull_request_number INTEGER,
@@ -353,7 +356,7 @@ export class Store {
           completed_at INTEGER
         )`);
         this.db.exec(`INSERT INTO workflows_restart
-          SELECT id, type, repository, installation_id, origin_subject_type, origin_subject_number, status,
+          SELECT id, type, repository, installation_id, origin_subject_type, origin_subject_number, status, phase,
             workspace_path, branch, pull_request_number, pull_request_url, turns, dependency_cycle,
             quarantined, quarantine_run_id, quarantine_reason, created_at, updated_at, completed_at
           FROM workflows`);
@@ -444,6 +447,7 @@ export class Store {
       originSubjectType: String(row.origin_subject_type) as SubjectType,
       originSubjectNumber: Number(row.origin_subject_number),
       status: String(row.status) as WorkflowRecord["status"],
+      phase: String(row.phase),
       workspacePath: row.workspace_path === null ? null : String(row.workspace_path),
       branch: row.branch === null ? null : String(row.branch),
       pullRequestNumber: row.pull_request_number === null ? null : Number(row.pull_request_number),
@@ -521,16 +525,28 @@ export class Store {
     repository: string;
     installationId: number;
     originSubjectNumber: number;
+    phase: string;
   }): WorkflowRecord {
     const workflowId = id("wf");
     const timestamp = now();
     const workspacePath = join(this.dataDirectory, "worktrees", workflowId);
     const branch = `gerry/${workflowId}`;
     this.db.query(`INSERT INTO workflows
-      (id, type, repository, installation_id, origin_subject_type, origin_subject_number, status,
+      (id, type, repository, installation_id, origin_subject_type, origin_subject_number, status, phase,
        workspace_path, branch, turns, quarantined, created_at, updated_at)
-      VALUES (?, ?, ?, ?, 'issue', ?, 'active', ?, ?, 0, 0, ?, ?)`)
-      .run(workflowId, input.type, input.repository, input.installationId, input.originSubjectNumber, workspacePath, branch, timestamp, timestamp);
+      VALUES (?, ?, ?, ?, 'issue', ?, 'active', ?, ?, ?, 0, 0, ?, ?)`)
+      .run(
+        workflowId,
+        input.type,
+        input.repository,
+        input.installationId,
+        input.originSubjectNumber,
+        input.phase,
+        workspacePath,
+        branch,
+        timestamp,
+        timestamp,
+      );
     return this.getWorkflow(workflowId);
   }
 
@@ -574,12 +590,16 @@ export class Store {
             repository: context.repository,
             installationId: context.installationId,
             originSubjectNumber: context.subject.number,
+            phase: rule.workflow_phase ?? "implementation",
           }).id;
         }
         if (!workflowId) workflowId = this.findWorkflowForContext(context, workflowType!)?.id ?? null;
         if (!workflowId) return skip("No matching workflow was found for this event");
         const workflow = this.getWorkflow(workflowId);
         if (workflow.type !== workflowType) return skip(`Workflow type mismatch: expected ${workflowType}, found ${workflow.type}`);
+        if (!rule.workflow_start && rule.workflow_phase && workflow.phase !== rule.workflow_phase) {
+          return skip(`Workflow phase is ${workflow.phase}; expected ${rule.workflow_phase}`);
+        }
         const discussionWhileWaiting = input.allowWaiting === true && workflow.status === "waiting";
         if (!input.resumeWorkflow && workflow.status !== "active" && !discussionWhileWaiting) {
           return skip(`Workflow is ${workflow.status}`);
@@ -588,6 +608,9 @@ export class Store {
         if (workflow.turns >= rule.max_turns) return skip(`Workflow turn limit reached (${rule.max_turns})`);
         if (input.resumeWorkflow) {
           this.db.query("UPDATE workflows SET status = 'active', updated_at = ? WHERE id = ?").run(now(), workflowId);
+        }
+        if (rule.workflow_start && rule.workflow_phase && workflow.phase !== rule.workflow_phase) {
+          this.db.query("UPDATE workflows SET phase = ?, updated_at = ? WHERE id = ?").run(rule.workflow_phase, now(), workflowId);
         }
         this.db.query("UPDATE workflows SET turns = turns + 1, updated_at = ? WHERE id = ?").run(now(), workflowId);
       }

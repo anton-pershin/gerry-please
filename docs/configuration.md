@@ -107,12 +107,13 @@ rules:
     prompt: examples/prompts/implement.md
     session: workflow # fresh (default) | conversation | workflow
     workflow: implementation # workflow type; defaults to rule name
-    workflow_start: true # creates the workflow for the origin issue; default false
+    workflow_start: true # creates or finds the workflow for the origin issue; default false
+    workflow_phase: implementation # start: enter this phase; resume: require this phase
     max_turns: 20 # per workflow instance; default 12
     once_per_subject: true
 ```
 
-Names must be unique. `conversation` is valid only with `session: conversation`; `workflow` and `workflow_start` are valid only with `session: workflow`. Persistent conversations are intended for `issue_comment`, `pull_request_review`, and `pull_request_review_comment` rules. Workflow agents must use `workspace: worktree`.
+Names must be unique. `conversation` is valid only with `session: conversation`; `workflow`, `workflow_start`, and `workflow_phase` are valid only with `session: workflow`. Persistent conversations are intended for `issue_comment`, `pull_request_review`, and `pull_request_review_comment` rules. Workflow agents must use `workspace: worktree`.
 
 ### Conditions
 
@@ -173,7 +174,11 @@ All agents in one conversation group must use the same workspace mode. Runtime/o
 
 ### Workflow rules
 
-`workflow_start: true` marks the rule that creates a workflow for an origin issue. Resume rules leave it `false` (the default) and never create a workflow when no matching instance exists. `workflow` is the type name, defaulting to the rule name. Instances have unique IDs, so the same type can run in parallel for many issues.
+`workflow_start: true` marks a rule that creates or finds a workflow for an origin issue. Resume rules leave it `false` (the default) and never create a workflow when no matching instance exists. `workflow` is the type name, defaulting to the rule name. Instances have unique IDs, so the same type can run in parallel for many issues.
+
+A workflow has a lifecycle status and an independent phase. On a start rule, `workflow_phase` selects the phase to enter and also supplies the initial phase when creating the workflow; the default is `implementation`. On a resume rule, it is a guard: Gerry skips dispatch unless the existing workflow is already in that phase. Phase transitions and run creation are transactional, and every start rule still follows the normal lifecycle, quarantine, turn-budget, and once-per-subject checks.
+
+The example supports two implementation paths. `approved` enters `implementation` directly. `requires-investigation` instead enters `investigation`, where the implementer posts its SDD investigation to the origin issue. Only `@implementer` comments on that issue resume investigation discussion. A later human `approved` label enters `implementation` on the same workflow, preserving the implementer session, worktree, branch, and discussion context. Investigation comments arriving after that transition are skipped. Investigation and implementation turns share the same workflow turn budget.
 
 PR events resolve the workflow through `pull_request.head.ref`. Gerry also records the PR number/URL. The example reviewer rule listens only for `pull_request.ready_for_review`; implementers open draft PRs, wait for checks on the exact head, and mark them ready after local checks and CI pass. Unfinished review revisions return to draft before pushing. Approval leaves the workflow active for further turns; a merged PR completes it, while closing without merging marks it closed. Reopening a closed PR reactivates the workflow. Later workflow dispatches are skipped while the workflow is `waiting`, `closed`, `completed`, or `abandoned`, while quarantined, or while another turn is active. `workflows abandon` releases a closed workflow's implementation ledger so a subsequent approval can create a replacement.
 

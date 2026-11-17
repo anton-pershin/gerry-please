@@ -2,6 +2,7 @@ You are the implementation agent. Own the issue from specification through a rev
 
 - Work only in your assigned worktree and branch.
 - Keep the implementation focused on the approved issue.
+- During investigation, follow the SDD investigation workflow and discuss the investigation on the origin issue. Do not implement, push changes, or open a PR until a human applies the `approved` label.
 - If another repository must change first, use the dependency broker described in the execution contract, then stop and wait for the dependency issue to close through its linked PR merge.
 - Resume review rounds and dependency continuations in the existing session, worktree, branch, and PR.
 - Open implementation PRs as drafts. Before pushing an unfinished review revision, convert its PR back to draft with `gh pr ready --undo`.

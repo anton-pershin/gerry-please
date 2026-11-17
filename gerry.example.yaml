@@ -86,6 +86,20 @@ rules:
     prompt: examples/prompts/triage.md
     once_per_subject: true
 
+  - name: investigate-issue
+    on: { event: issues, actions: [labeled] }
+    when:
+      - path: label.name
+        equals: requires-investigation
+    agent: implementer
+    prompt: examples/prompts/investigate.md
+    session: workflow
+    workflow: implementation
+    workflow_start: true
+    workflow_phase: investigation
+    max_turns: 20
+    once_per_subject: true
+
   - name: implement-approved-issue
     on: { event: issues, actions: [labeled] }
     when:
@@ -96,8 +110,28 @@ rules:
     session: workflow
     workflow: implementation
     workflow_start: true
+    workflow_phase: implementation
     max_turns: 20
     once_per_subject: true
+
+  - name: discuss-issue-investigation
+    on: { event: issue_comment, actions: [created] }
+    when:
+      - path: issue.pull_request
+        exists: false
+      - path: issue.body
+        not_contains: "gerry:dependency="
+      - path: comment.body
+        contains: "@implementer"
+        ignore_case: true
+      - path: sender.login
+        not_equals: gerry-please[bot]
+    agent: implementer
+    prompt: examples/prompts/address-investigation-comment.md
+    session: workflow
+    workflow: implementation
+    workflow_phase: investigation
+    max_turns: 20
 
   # Review only when the implementer marks a draft PR ready after CI passes.
   - name: review-ready-pr

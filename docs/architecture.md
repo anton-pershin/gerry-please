@@ -6,7 +6,7 @@ A **delivery** is one verified GitHub webhook identified by `X-GitHub-Delivery`.
 
 A **subject** is an issue, pull request, or repository. `issue_comment` on a PR is normalized to a pull-request subject. A **conversation** is `(repository, subject type, subject number, group name)`. A **conversation session** is additionally scoped by agent, so two agents never resume each other’s runtime context.
 
-A **workflow** is a unique, typed execution instance rooted at an issue. It owns per-agent sessions, a worktree/branch, optional PR identity, turn budget, dependencies, status, and quarantine. Its type (for example `implementation`) is not a singleton: independent issues create independent instances that can execute in parallel. A **dependency** links a parent workflow to a target-repository issue and records the issue-close/PR-merge facts required for resolution.
+A **workflow** is a unique, typed execution instance rooted at an issue. It owns per-agent sessions, a worktree/branch, optional PR identity, turn budget, dependencies, lifecycle status, phase, and quarantine. Its type (for example `implementation`) is not a singleton: independent issues create independent instances that can execute in parallel. Lifecycle status controls whether work can execute; phase selects which rules and prompts are eligible without replacing that status. A **dependency** links a parent workflow to a target-repository issue and records the issue-close/PR-merge facts required for resolution.
 
 ## Ingress invariants
 
@@ -55,6 +55,8 @@ A hidden `<!-- gerry:run=... -->` comment marker links a newly triggered run to 
 ## Workflow execution
 
 A rule with `workflow_start: true` creates or finds a workflow for its origin issue. Resume rules find an existing instance by origin issue or PR head branch; they never create one implicitly. The workflow ID determines its worktree and `gerry/<workflow-id>` branch, so an implementer opening a PR from that branch creates a durable issue-to-PR link.
+
+Workflow phase is independent of lifecycle status. A start rule with `workflow_phase` enters that phase when it queues a run; a resume rule with the same field dispatches only when the phase already matches. The example uses this to let `requires-investigation` and `approved` select investigation or implementation without creating separate workflows. Tagged origin-issue comments are eligible only during investigation, while approval preserves the same compatibility-checked implementer session and workspace for implementation.
 
 Every matching review turn resumes the same compatibility-checked agent session and workspace. Reviewer dispatch uses the native `pull_request.ready_for_review` readiness signal rather than PR creation or every push: implementers keep CI-dependent revisions draft and mark them ready only after checks pass. Independent workflow IDs have no shared execution lock, permitting parallel implementations. An approving PR review leaves the workflow active so follow-up turns can still run. Only a merged PR marks it completed; closing without merging marks it closed, and reopening reactivates it. An operator can instead abandon a closed-unmerged workflow with no active run: its history and artifacts remain, while a later approval creates a replacement workflow ID. SQLite permits multiple abandoned workflows per origin but only one non-abandoned workflow.
 
