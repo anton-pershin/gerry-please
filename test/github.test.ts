@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, test } from "bun:test";
-import { buildAgentEnvironment, hasSufficientTokenLifetime, verifyPullRequestClosureEvidence, verifyWebhookSignature } from "../src/github.ts";
+import { buildAgentEnvironment, GitHubAppTokens, hasSufficientTokenLifetime, verifyPullRequestClosureEvidence, verifyWebhookSignature } from "../src/github.ts";
 import { configFixture } from "./helpers.ts";
 
 describe("GitHub integration", () => {
@@ -72,6 +72,36 @@ describe("GitHub integration", () => {
     expect(hasSufficientTokenLifetime(Date.parse("2026-11-10T15:55:00Z"), 0, timestamp)).toBe(false);
   });
 
+  test("forces Octokit to refresh tokens rejected by the outer lifetime cache", async () => {
+    const tokens = new GitHubAppTokens({ appId: "1", privateKey: "unused", webhookSecret: "unused" });
+    const calls: Array<{ type: string; repositoryNames: string[]; refresh: boolean }> = [];
+    let issued = 0;
+    Object.assign(tokens, {
+      app: {
+        getInstallationOctokit: async () => ({
+          auth: async (options: { type: string; repositoryNames: string[]; refresh: boolean }) => {
+            calls.push(options);
+            issued += 1;
+            return {
+              type: "token",
+              token: `test-token-${issued}`,
+              expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+            };
+          },
+        }),
+      },
+    });
+
+    const first = await tokens.get(1234, "acme/widgets", 15 * 60_000);
+    expect(await tokens.get(1234, "acme/widgets", 15 * 60_000)).toBe(first);
+    expect(calls).toHaveLength(1);
+
+    expect(await tokens.get(1234, "acme/widgets", 2 * 60 * 60_000)).toBe("test-token-2");
+    expect(calls).toHaveLength(2);
+    expect(calls.map((call) => call.refresh)).toEqual([true, true]);
+    expect(calls[0]?.repositoryNames).toEqual(["widgets"]);
+  });
+
   test("only forwards explicitly allowed process environment variables", () => {
     const { config } = configFixture();
     const agent = { ...config.agents.implementer!, pass_environment: ["MODEL_API_KEY"] };
@@ -93,6 +123,7 @@ describe("GitHub integration", () => {
     expect(environment.GITHUB_APP_PRIVATE_KEY_PATH).toBeUndefined();
     expect(environment.GH_TOKEN).toBe("installation-token");
     expect(environment.GH_CONFIG_DIR).toContain("run_1");
-    expect(environment.GIT_CONFIG_VALUE_0).toContain("$GH_TOKEN");
+    expect(environment.GIT_CONFIG_VALUE_0).toBe("");
+    expect(environment.GIT_CONFIG_VALUE_1).toContain("$GH_TOKEN");
   });
 });

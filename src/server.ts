@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { LoadedConfig } from "./config.ts";
+import type { AgentCredentialService } from "./credentials.ts";
 import type { DependencyService } from "./dependencies.ts";
 import { readPrompt, resolveConfigPath } from "./config.ts";
 import { verifyWebhookSignature, type GitHubSecrets } from "./github.ts";
@@ -192,6 +193,7 @@ export function createFetchHandler(input: {
   store: Store;
   webhook: WebhookHandler;
   dependencies?: DependencyService;
+  credentials?: AgentCredentialService;
 }): (request: Request) => Promise<Response> {
   return async (request: Request): Promise<Response> => {
     const url = new URL(request.url);
@@ -199,6 +201,9 @@ export function createFetchHandler(input: {
       return response({ ok: true, runs: input.store.stats() });
     }
     if (url.pathname === "/webhooks/github") return input.webhook.handle(request);
+    if (url.pathname === "/agent/github/token" && input.credentials) {
+      return input.credentials.handleAgentRequest(request);
+    }
     if (url.pathname === "/agent/dependencies" && input.dependencies) {
       return input.dependencies.handleAgentRequest(request);
     }

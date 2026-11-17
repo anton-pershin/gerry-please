@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { readPrompt, type RuleConfig } from "../src/config.ts";
 import { Logger } from "../src/observability.ts";
@@ -101,6 +101,13 @@ describe("worker execution", () => {
     expect(fixture.runtime.inputs[0]!.prompt).not.toContain("Changed instructions");
     expect(fixture.runtime.inputs[0]!.prompt).toContain("<!-- gerry:run=");
     expect(fixture.tokenCalls).toEqual([[1234, "acme/widgets", 1_860_000]]);
+    const environment = fixture.runtime.inputs[0]!.environment;
+    expect(environment.GERRY_AGENT_TOKEN).toBeDefined();
+    expect(environment.GIT_CONFIG_VALUE_1).toContain("git-credential-gerry");
+    const wrapperDirectory = environment.PATH?.split(":")[0];
+    expect(wrapperDirectory).toBeDefined();
+    expect(existsSync(wrapperDirectory!)).toBe(false);
+    expect(run.agentCapabilityHash).toBeNull();
     const events = readFileSync(join(fixture.config.dataDir, "runs", run.id, "attempts", "1", "events.jsonl"), "utf8");
     const response = readFileSync(join(fixture.config.dataDir, "runs", run.id, "response.md"), "utf8");
     expect(events).not.toContain("secret-installation-token");

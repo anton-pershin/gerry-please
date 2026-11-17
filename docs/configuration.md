@@ -90,6 +90,10 @@ Hermes options:
 
 Unknown runtime options are errors. Gerry does not expose a `yolo` option.
 
+### Agent GitHub credentials
+
+No additional configuration is required. Gerry places a temporary `gh` wrapper and Git credential helper on each run's command path. New commands use the loopback `/agent/github/token` broker to obtain same-repository installation tokens while the run is active. The broker uses the run's capability and stored identity; agents cannot select another repository. The wrapper directory is removed and the capability invalidated after the attempt. An individual long-running process keeps its starting token, so use repeated bounded checks rather than a single watch that outlives the token.
+
 ## `rules`
 
 ```yaml

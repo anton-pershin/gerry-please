@@ -6,6 +6,7 @@ import { DependencyService } from "./dependencies.ts";
 import { GitHubAppTokens, loadGitHubSecrets } from "./github.ts";
 import { InstanceLock } from "./instance-lock.ts";
 import { Logger, writeRunSummary } from "./observability.ts";
+import { AgentCredentialService } from "./credentials.ts";
 import { createRuntimes } from "./runtimes/index.ts";
 import { hermesArguments } from "./runtimes/hermes.ts";
 import { validateOpenCodeOptions } from "./runtimes/opencode.ts";
@@ -131,13 +132,14 @@ async function serve(config: LoadedConfig, skipChecks: boolean): Promise<void> {
     }
   }
   const dependencies = new DependencyService(config, store, tokens, logger);
+  const credentials = new AgentCredentialService(store, tokens, logger);
   const workers = new WorkerPool({ config, store, runtimes, tokens, logger, runGate: dependencies });
   const webhook = new WebhookHandler(config, store, secrets, logger, dependencies);
   await webhook.recover();
   const server = Bun.serve({
     hostname: config.server.host,
     port: config.server.port,
-    fetch: createFetchHandler({ config, store, webhook, dependencies }),
+    fetch: createFetchHandler({ config, store, webhook, dependencies, credentials }),
   });
   workers.start();
   const dependencyRecovery = setInterval(() => {

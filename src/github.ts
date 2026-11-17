@@ -116,6 +116,7 @@ export class GitHubAppTokens {
     const authentication = (await octokit.auth({
       type: "installation",
       repositoryNames: [repositoryName],
+      refresh: true,
     })) as InstallationAccessTokenAuthentication;
     if (authentication.type !== "token" || !authentication.token || !authentication.expiresAt) {
       throw new Error(`Could not obtain an installation token for ${repositoryFullName} (installation ${installationId})`);
@@ -308,9 +309,11 @@ export function gitCredentialEnvironment(token: string): Record<string, string> 
     GH_TOKEN: token,
     GITHUB_TOKEN: token,
     GIT_TERMINAL_PROMPT: "0",
-    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_COUNT: "2",
     GIT_CONFIG_KEY_0: "credential.https://github.com.helper",
-    GIT_CONFIG_VALUE_0: "!f() { echo username=x-access-token; echo password=\"$GH_TOKEN\"; }; f",
+    GIT_CONFIG_VALUE_0: "",
+    GIT_CONFIG_KEY_1: "credential.https://github.com.helper",
+    GIT_CONFIG_VALUE_1: "!f() { echo username=x-access-token; echo password=\"$GH_TOKEN\"; }; f",
   };
 }
 

@@ -91,7 +91,9 @@ The delivery/rule dispatch is `skipped` with a turn-limit reason. Read the discu
 
 Pre-runtime failures enter `retry_wait` with exponential backoff. Check `doctor` and service logs. Other runtime-start failures do not auto-replay, even when they look transient, because the exact point of failure is not a safe transaction boundary.
 
-GitHub App installation tokens expire after about one hour. At run startup, Gerry reuses a cached token only when its remaining lifetime covers the agent's configured attempt timeout plus one minute; otherwise, it issues a fresh token. This prevents a long attempt from starting with a token that is already near expiry.
+GitHub App installation tokens have a fixed lifetime of about one hour; Gerry cannot extend it. At run startup, Gerry reuses a cached token only when its remaining lifetime covers the agent's configured attempt timeout plus one minute. Otherwise, it forces Octokit to issue a fresh token rather than accepting Octokit's own cached copy. This prevents a long attempt from starting with a token that is already near expiry.
+
+During an active run, the provided `gh` command and Git credential helper obtain credentials from Gerry's loopback broker at the start of each new command or Git authentication request. The broker authenticates the per-run capability, derives the repository and installation from the run record, and stops issuing tokens when the run ends. A process that remains alive across the token deadline retains its original token: split long operations such as `gh pr checks --watch` into shorter repeated checks. Do not automatically replay arbitrary mutating commands after an ambiguous authentication failure.
 
 A structured provider-quota error also enters `retry_wait`, but preserves the active workflow and retries indefinitely: after five minutes initially, then with delays doubled up to one hour. The provider response does not necessarily include a reset timestamp, so these attempts are periodic probes rather than a claim about the exact reset time. `runs show` displays `availableAt`, and `summary.md` displays the next attempt time. The same run, session, worktree, and branch resume when an attempt is due. Restarting Gerry does not cancel the wait, and an idle retry wait consumes no worker. Use `runs cancel` if waiting is no longer desired; use `runs retry` once for a quota run that already reached `failed` under an older Gerry version.
 
@@ -117,7 +119,7 @@ Define retention based on issue/PR sensitivity and token/tool output exposure. R
 
 - Use a dedicated least-privilege OS user and protect the data directory.
 - Install the GitHub App only on intended repositories with only required permissions.
-- Use TLS at the reverse proxy and retain the default loopback bind. Expose `/webhooks/github` and optionally `/health`, but never proxy `/agent/dependencies`; its per-run capabilities are intended only for local agents.
+- Use TLS at the reverse proxy and retain the default loopback bind. Expose `/webhooks/github` and optionally `/health`, but never proxy `/agent/` endpoints; their per-run capabilities are intended only for local agents.
 - Keep runtime provider credentials in runtime-managed profiles/configuration.
 - Set Hermes unattended/single-query approvals to deny; avoid `--yolo` and broad shell access.
 - Consider runtime container backends for untrusted repositories or issues. Worktrees alone do not contain prompt-injection-driven host commands.
