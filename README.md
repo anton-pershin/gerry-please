@@ -60,7 +60,7 @@ See [docs/architecture.md](docs/architecture.md) for invariants and [docs/config
 - Bun 1.3 or newer
 - Git and [GitHub CLI](https://cli.github.com/) (`gh`)
 - A GitHub App
-- OpenCode V2 for OpenCode agents and/or [Nous Research Hermes Agent](https://github.com/NousResearch/hermes-agent) for Hermes agents
+- OpenCode V2 **2.3.0 or newer** for OpenCode agents and/or [Nous Research Hermes Agent](https://github.com/NousResearch/hermes-agent) for Hermes agents
 - A local canonical checkout of every configured repository
 
 Hermes provider/model credentials should be configured in the selected Hermes profile. OpenCode provider credentials remain in OpenCode. They are not managed by Gerry.
