@@ -29,6 +29,48 @@ export function validateOpenCodeOptions(options: Record<string, unknown>): void 
   if (parsed.model) parseModel(parsed.model);
 }
 
+export interface OpenCodeBackgroundJob {
+  id: string;
+  kind: "shell" | "subagent" | "image";
+  sessionID: string;
+  status: "running" | "completed" | "error" | "cancelled";
+  childSessionID?: string;
+}
+
+export type ListOpenCodeBackgroundJobs = (sessionID: string, signal: AbortSignal) => Promise<OpenCodeBackgroundJob[]>;
+
+export function createOpenCodeBackgroundJobLister(client: OpenCodeClient): ListOpenCodeBackgroundJobs {
+  return async (sessionID, signal) => client.experimental.job.list({ sessionID, descendants: true }, { signal });
+}
+
+export async function readOpenCodeSessionGeneration(
+  client: OpenCodeClient,
+  sessionID: string,
+  signal: AbortSignal,
+): Promise<number> {
+  let generation = 0;
+  for await (const item of client.experimental.session.log({ sessionID, follow: false }, { signal })) {
+    if (item.type === "log.synced") return item.seq ?? generation;
+    generation = Math.max(generation, item.durable.seq);
+  }
+  return generation;
+}
+
+export function isSupportedOpenCodeVersion(version: string): boolean {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:-|$)/.exec(version);
+  if (!match) return false;
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  return major > 2 || (major === 2 && minor >= 3);
+}
+
+function makeRuntime(name: string, baseUrl: string, headers?: RequestInit["headers"]): OpenCodeRuntime {
+  const options: { baseUrl: string; headers?: RequestInit["headers"] } = { baseUrl };
+  if (headers) options.headers = headers;
+  const client = OpenCode.make(options);
+  return new OpenCodeRuntime(client, name, createOpenCodeBackgroundJobLister(client));
+}
+
 const COLLECTION_COMPLETE = "OpenCode event collection complete";
 
 function sessionIDFromEvent(event: OpenCodeEvent): string | null {
@@ -65,7 +107,7 @@ export function isOpenCodeProviderQuotaError(error: unknown): boolean {
     (error as { type?: unknown }).type === "provider.quota";
 }
 
-export async function waitForOpenCodeSession(input: {
+async function waitForSessionIdle(input: {
   client: OpenCodeClient;
   sessionID: string;
   timeoutMs: number;
@@ -88,12 +130,161 @@ export async function waitForOpenCodeSession(input: {
   }
 }
 
+type OpenCodeInboxItem = Awaited<ReturnType<OpenCodeClient["session"]["inbox"]["list"]>>[number];
+
+async function listOpenCodeSessionTree(
+  client: OpenCodeClient,
+  rootSessionID: string,
+  signal: AbortSignal,
+): Promise<string[]> {
+  const seen = new Set([rootSessionID]);
+  const queue = [rootSessionID];
+  for (let index = 0; index < queue.length; index += 1) {
+    const parentID = queue[index]!;
+    let cursor: string | undefined;
+    while (true) {
+      const response = await client.session.list({
+        parentID,
+        limit: 100,
+        ...(cursor ? { cursor } : {}),
+      }, { signal });
+      for (const child of response.data) {
+        if (!seen.has(child.id)) {
+          seen.add(child.id);
+          queue.push(child.id);
+        }
+      }
+      if (response.data.length < 100) break;
+      cursor = response.cursor.next ?? undefined;
+      if (!cursor) break;
+    }
+  }
+  return [...seen];
+}
+
+async function readSessionGenerations(
+  sessionIDs: string[],
+  read: (sessionID: string) => Promise<number>,
+): Promise<Map<string, number>> {
+  return new Map(await Promise.all(sessionIDs.map(async (sessionID) => [sessionID, await read(sessionID)] as const)));
+}
+
+async function readSessionInboxes(
+  client: OpenCodeClient,
+  sessionIDs: string[],
+  signal: AbortSignal,
+): Promise<Map<string, OpenCodeInboxItem[]>> {
+  return new Map(await Promise.all(sessionIDs.map(async (sessionID) => [
+    sessionID,
+    await client.session.inbox.list({ sessionID }, { signal }),
+  ] as const)));
+}
+
+function inboxCount(inboxes: Map<string, OpenCodeInboxItem[]>): number {
+  return [...inboxes.values()].reduce((count, items) => count + items.length, 0);
+}
+
+export async function waitForOpenCodeSession(input: {
+  client: OpenCodeClient;
+  sessionID: string;
+  timeoutMs: number;
+  signal: AbortSignal;
+  listBackgroundJobs: ListOpenCodeBackgroundJobs;
+  getSessionGeneration: (sessionID: string) => Promise<number>;
+  emit?: (event: { type: string; data: unknown }) => void;
+}): Promise<void> {
+  let previousActivity = "";
+  let pollDelay = 50;
+  while (true) {
+    await waitForSessionIdle(input);
+    const session = await input.client.session.get({ sessionID: input.sessionID }, { signal: input.signal });
+    // Failed/interrupted attempts retain their ambiguous recovery semantics and
+    // return promptly for outer classification. Only successful completion gets
+    // the tree-quiescence guarantee below; failure recovery must reconcile work
+    // that may still be running before retrying or resolving the attempt.
+    if (session.outcome === "failed" || session.outcome === "interrupted") return;
+
+    // Bracket the whole session tree with durable watermarks. Any turn, report,
+    // new descendant, or job on either side of these snapshots restarts the pass.
+    const sessionsBefore = await listOpenCodeSessionTree(input.client, input.sessionID, input.signal);
+    const generationBefore = await readSessionGenerations(sessionsBefore, input.getSessionGeneration);
+    const jobsBefore = await input.listBackgroundJobs(input.sessionID, input.signal);
+    const inboxBefore = await readSessionInboxes(input.client, sessionsBefore, input.signal);
+    const activeBefore = await input.client.session.active({ signal: input.signal });
+    const jobsAfter = await input.listBackgroundJobs(input.sessionID, input.signal);
+    const sessionsAfter = await listOpenCodeSessionTree(input.client, input.sessionID, input.signal);
+    const allSessionIDs = [...new Set([...sessionsBefore, ...sessionsAfter])];
+    const inboxAfter = await readSessionInboxes(input.client, allSessionIDs, input.signal);
+    const activeAfter = await input.client.session.active({ signal: input.signal });
+    const generationAfter = await readSessionGenerations(allSessionIDs, input.getSessionGeneration);
+    const activeSessionIDs = allSessionIDs.filter((sessionID) => activeBefore[sessionID] || activeAfter[sessionID]);
+    const sameSessionTree = [...sessionsBefore].sort().join("\n") === [...sessionsAfter].sort().join("\n");
+    const generationChanged = allSessionIDs.some((sessionID) => generationBefore.get(sessionID) !== generationAfter.get(sessionID));
+    if (sameSessionTree && !generationChanged && activeSessionIDs.length === 0 &&
+        jobsBefore.length === 0 && jobsAfter.length === 0 &&
+        inboxCount(inboxBefore) === 0 && inboxCount(inboxAfter) === 0) {
+      return;
+    }
+
+    const jobs = [...new Map([...jobsBefore, ...jobsAfter].map((job) => [job.id, job])).values()];
+    const activity = JSON.stringify({
+      jobs: jobs.map((job) => [job.id, job.status]),
+      activeSessionIDs,
+      inboxBefore: inboxCount(inboxBefore),
+      inboxAfter: inboxCount(inboxAfter),
+      sameSessionTree,
+      generationChanged,
+    });
+    if (activity !== previousActivity) {
+      previousActivity = activity;
+      const inboxItems = (inboxes: Map<string, OpenCodeInboxItem[]>) => [...inboxes].flatMap(([sessionID, items]) =>
+        items.map((item) => ({ sessionID, id: item.id, type: item.type, delivery: item.delivery })),
+      );
+      input.emit?.({
+        type: "opencode.session.background_activity",
+        data: {
+          jobs: jobs.map((job) => ({
+            id: job.id,
+            kind: job.kind,
+            sessionID: job.sessionID,
+            status: job.status,
+            ...(job.childSessionID ? { childSessionID: job.childSessionID } : {}),
+          })),
+          activeSessionIDs,
+          inboxBefore: inboxCount(inboxBefore),
+          inboxAfter: inboxCount(inboxAfter),
+          inboxBeforeItems: inboxItems(inboxBefore),
+          inboxAfterItems: inboxItems(inboxAfter),
+          sameSessionTree,
+          generationBefore: Object.fromEntries(generationBefore),
+          generationAfter: Object.fromEntries(generationAfter),
+        },
+      });
+    }
+
+    const childSessions = [...new Set(jobs.flatMap((job) =>
+      job.kind === "subagent" && job.status === "running" && job.childSessionID ? [job.childSessionID] : [],
+    ))];
+    if (childSessions.length > 0) {
+      await Promise.all(childSessions.map((sessionID) => waitForSessionIdle({ ...input, sessionID })));
+      pollDelay = 50;
+    } else {
+      // Shell and image jobs have no session wait endpoint. Terminal reports
+      // can also be waiting to wake a session. Back off while preserving the
+      // overall attempt deadline instead of returning on a timing heuristic.
+      await sleep(pollDelay, input.signal);
+      pollDelay = Math.min(pollDelay * 2, 1_000);
+    }
+  }
+}
+
 export class OpenCodeRuntime implements AgentRuntime {
   readonly type = "opencode" as const;
 
   constructor(
     private readonly client: OpenCodeClient,
     readonly name: string,
+    private readonly listBackgroundJobs: ListOpenCodeBackgroundJobs,
   ) {}
 
   static async fromConfig(
@@ -103,26 +294,28 @@ export class OpenCodeRuntime implements AgentRuntime {
     if (config.base_url) {
       const token = config.token_env ? context.environment[config.token_env] : undefined;
       if (config.token_env && !token) throw new Error(`Missing OpenCode token environment variable: ${config.token_env}`);
-      return new OpenCodeRuntime(
-        OpenCode.make({
-          baseUrl: config.base_url,
-          ...(token ? { headers: { authorization: `Bearer ${token}` } } : {}),
-        }),
+      return makeRuntime(
         context.name,
+        config.base_url,
+        token ? { authorization: `Bearer ${token}` } : undefined,
       );
     }
-    const endpoint = await Service.ensure();
-    return new OpenCodeRuntime(OpenCode.make({ baseUrl: endpoint.url, headers: Service.headers(endpoint) }), context.name);
+    const endpoint = await Service.ensure({ version: isSupportedOpenCodeVersion });
+    return makeRuntime(context.name, endpoint.url, Service.headers(endpoint));
   }
 
   async check(): Promise<void> {
-    await withDeadline(this.client.server.info(), 10_000, "OpenCode health check timed out");
+    const info = await withDeadline(this.client.server.info(), 10_000, "OpenCode health check timed out");
+    if (!isSupportedOpenCodeVersion(info.version)) {
+      throw new Error(`OpenCode server ${info.version} is unsupported; Gerry requires OpenCode >= 2.3.0`);
+    }
   }
 
   async run(input: RuntimeRunInput): Promise<RuntimeResult> {
     if (input.signal.aborted) throw new RuntimeExecutionError(compactError(input.signal.reason));
     validateOpenCodeOptions(input.options);
     const options = optionsSchema.parse(input.options);
+    await this.check();
     const controller = new AbortController();
     const abort = () => controller.abort(input.signal.reason);
     input.signal.addEventListener("abort", abort, { once: true });
@@ -225,6 +418,8 @@ export class OpenCodeRuntime implements AgentRuntime {
         sessionID: sessionId,
         timeoutMs: input.timeoutMs,
         signal,
+        listBackgroundJobs: this.listBackgroundJobs,
+        getSessionGeneration: (sessionID) => readOpenCodeSessionGeneration(this.client, sessionID, signal),
         emit: input.emit,
       });
       executionIdle = true;

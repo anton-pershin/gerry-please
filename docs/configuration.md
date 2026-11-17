@@ -49,6 +49,8 @@ runtimes:
     token_env: OPENCODE_TOKEN
 ```
 
+OpenCode **2.3.0 or newer** is required. Gerry checks this during local service discovery, integration checks, and every run before prompt admission. A run does not complete merely because its parent session is idle: Gerry waits for all descendant subagents, every tracked shell job, and their completion reports. It also revalidates the complete descendant tree on both sides of the check, requiring unchanged membership and server-authoritative durable log watermarks, no active execution anywhere in the tree, and empty jobs/inbox so a consumed report, active child, or newly created job cannot slip through a stale snapshot and wake a session after credential cleanup. Persistent services such as report servers must be launched by a foreground command that detaches them with `nohup` and redirected stdin/stdout/stderr; do not leave them as tracked OpenCode background jobs.
+
 ### Hermes
 
 ```yaml

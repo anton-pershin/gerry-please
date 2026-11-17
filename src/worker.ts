@@ -79,6 +79,9 @@ function buildPrompt(input: {
     `Gerry obtains fresh repository credentials for each new command. Do not bypass the provided \`gh\` command or Git credential helper. ` +
     `Do not use \`gh auth token\` or override credentials with personal or stored credentials. ` +
     `Never print or persist credentials. Do not read or modify Gerry's own configuration, database, or data directory. ` +
+    `Do not finish with tracked background jobs, including jobs left by earlier turns: await subagents and commands and consume their results. ` +
+    `If an earlier review service is still tracked, stop it during the current turn and consume its completion report before restarting it. ` +
+    `Start persistent review services only through a foreground launcher that detaches them with nohup and redirected stdin/stdout/stderr, so no tracked job can later wake this session. ` +
     `When writing a GitHub issue comment, PR comment, or review, append the hidden lineage marker ` +
     `\`<!-- gerry:run=${input.run.id} -->\` on its own line. ` +
     `If the task needs an operation outside your configured permissions, stop and explain what configuration change is required.` +

@@ -23,7 +23,7 @@
   },
   "dependencies": {
     "@octokit/app": "^16.1.0",
-    "@opencode/client": "latest",
+    "@opencode/client": "^2.3.0",
     "yaml": "^2.8.1",
     "zod": "^4.1.12"
   },

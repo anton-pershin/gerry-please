@@ -47,7 +47,15 @@ Once-per-subject ownership is restored on retry unless another run has since acq
 
 At the next startup, after acquiring the single-instance lock, Gerry marks every previously active run `interrupted` and quarantines its conversation. Do not assume this means the runtime stopped. OpenCode or a Hermes gateway may have finished accepted work. Reconcile external effects before retrying or resolving.
 
+The tree-quiescence guarantee applies to successful OpenCode completion. A failed or interrupted attempt returns promptly for error classification without waiting for all descendants, and a child can still finish or report afterward. Inspect the session tree, running jobs, worktree, and GitHub effects before retrying or resolving such an attempt. A retry supplies fresh credentials; never treat credential cleanup as proof that a failed session tree stopped.
+
 Incomplete `received`/`dispatch_failed` deliveries are redispatched idempotently during startup. Queued and retry-waiting runs remain durable. No active agent attempt is automatically resumed after a crash.
+
+## OpenCode upgrades and persistent services
+
+OpenCode agents require server and client 2.3.0 or newer. `doctor` and run admission reject older explicit servers; local discovery also requires a compatible registered service.
+
+Activity-aware completion waits for every tracked background job, including jobs left by older runs. If an existing session has a persistent report server registered as an OpenCode background shell, stop that process during an active agent turn and let the parent consume its completion report. Then restart the service through a foreground launcher that uses `nohup` with stdin/stdout/stderr redirected. There is no detach operation: `shell.remove` is not a safe way to detach a harness-managed background process and may not cover its job record. Verify that the jobs API no longer lists the old process. A detached service has no tracked completion report that can resume the parent after Gerry cleans run credentials.
 
 ## Configuration errors
 
