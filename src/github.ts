@@ -116,6 +116,7 @@ export class GitHubAppTokens {
     const authentication = (await octokit.auth({
       type: "installation",
       repositoryNames: [repositoryName],
+      refresh: true,
     })) as InstallationAccessTokenAuthentication;
     if (authentication.type !== "token" || !authentication.token || !authentication.expiresAt) {
       throw new Error(`Could not obtain an installation token for ${repositoryFullName} (installation ${installationId})`);

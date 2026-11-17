@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, test } from "bun:test";
-import { buildAgentEnvironment, hasSufficientTokenLifetime, verifyPullRequestClosureEvidence, verifyWebhookSignature } from "../src/github.ts";
+import { buildAgentEnvironment, GitHubAppTokens, hasSufficientTokenLifetime, verifyPullRequestClosureEvidence, verifyWebhookSignature } from "../src/github.ts";
 import { configFixture } from "./helpers.ts";
 
 describe("GitHub integration", () => {
@@ -70,6 +70,36 @@ describe("GitHub integration", () => {
     expect(hasSufficientTokenLifetime(Date.parse("2026-11-10T16:05:00Z"), 15 * 60_000, timestamp)).toBe(false);
     expect(hasSufficientTokenLifetime(Date.parse("2026-11-10T15:57:00Z"), 0, timestamp)).toBe(true);
     expect(hasSufficientTokenLifetime(Date.parse("2026-11-10T15:55:00Z"), 0, timestamp)).toBe(false);
+  });
+
+  test("forces Octokit to refresh tokens rejected by the outer lifetime cache", async () => {
+    const tokens = new GitHubAppTokens({ appId: "1", privateKey: "unused", webhookSecret: "unused" });
+    const calls: Array<{ type: string; repositoryNames: string[]; refresh: boolean }> = [];
+    let issued = 0;
+    Object.assign(tokens, {
+      app: {
+        getInstallationOctokit: async () => ({
+          auth: async (options: { type: string; repositoryNames: string[]; refresh: boolean }) => {
+            calls.push(options);
+            issued += 1;
+            return {
+              type: "token",
+              token: `test-token-${issued}`,
+              expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+            };
+          },
+        }),
+      },
+    });
+
+    const first = await tokens.get(1234, "acme/widgets", 15 * 60_000);
+    expect(await tokens.get(1234, "acme/widgets", 15 * 60_000)).toBe(first);
+    expect(calls).toHaveLength(1);
+
+    expect(await tokens.get(1234, "acme/widgets", 2 * 60 * 60_000)).toBe("test-token-2");
+    expect(calls).toHaveLength(2);
+    expect(calls.map((call) => call.refresh)).toEqual([true, true]);
+    expect(calls[0]?.repositoryNames).toEqual(["widgets"]);
   });
 
   test("only forwards explicitly allowed process environment variables", () => {
