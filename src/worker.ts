@@ -1,7 +1,8 @@
 import { createHash, randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { LoadedConfig } from "./config.ts";
+import { applyAgentCredentialWrappers, writeAgentCredentialWrappers } from "./credentials.ts";
 import { buildAgentEnvironment, gitCredentialEnvironment } from "./github.ts";
 import { AttemptRecorder, Logger, Redactor, atomicWrite, writeRunSummary } from "./observability.ts";
 import { buildContext, renderTemplate, templateRoot } from "./rules.ts";
@@ -74,8 +75,9 @@ function buildPrompt(input: {
     `- Branch: ${input.branch ? `\`${input.branch}\`` : "shared checkout; do not create commits unless the task explicitly requires them"}\n` +
     `${input.run.workflowId ? `- Workflow: \`${input.run.workflowType}\` / \`${input.run.workflowId}\`\n` : ""}` +
     `- Complete webhook context: \`${input.contextPath}\`\n\n` +
-    `Work only inside the assigned workspace. Use \`gh\` with the provided GH_TOKEN for GitHub operations. ` +
-    `Do not use \`gh auth token\` or override GH_TOKEN with personal or stored credentials. ` +
+    `Work only inside the assigned workspace. Use \`gh\` and Git normally for GitHub operations; ` +
+    `Gerry obtains fresh repository credentials for each new command. Do not bypass the provided \`gh\` command or Git credential helper. ` +
+    `Do not use \`gh auth token\` or override credentials with personal or stored credentials. ` +
     `Never print or persist credentials. Do not read or modify Gerry's own configuration, database, or data directory. ` +
     `When writing a GitHub issue comment, PR comment, or review, append the hidden lineage marker ` +
     `\`<!-- gerry:run=${input.run.id} -->\` on its own line. ` +
@@ -139,6 +141,7 @@ export class WorkerPool {
     let runtimeStarted = false;
     let heartbeat: Timer | undefined;
     let recorder: AttemptRecorder | undefined;
+    let credentialDirectory: string | undefined;
     let sessionCompatibilityHash = "";
     try {
       logger.info("run.started", { runId: run.id, attempt: run.attempt, rule: run.ruleName, agent: run.agentName });
@@ -225,16 +228,31 @@ export class WorkerPool {
         repository: run.repository,
         workspacePath: workspace.workspacePath,
       });
+      const brokerHost = ["0.0.0.0", "::", ""].includes(config.server.host) ? "127.0.0.1" : config.server.host;
+      const credentialUrl = `http://${brokerHost}:${config.server.port}/agent/github/token`;
+      const realGhPath = Bun.which("gh");
+      if (!realGhPath) throw new Error("GitHub CLI is unavailable");
+      credentialDirectory = this.workspace.temporaryDirectory(run.id);
+      writeAgentCredentialWrappers({
+        directory: credentialDirectory,
+        runId: run.id,
+        credentialUrl,
+        realGhPath,
+      });
+      applyAgentCredentialWrappers(environment, credentialDirectory);
+      environment.GERRY_AGENT_TOKEN = capability;
+      store.setAgentCapability(run.id, createHash("sha256").update(capability).digest("hex"), workerId);
+      recorder.emit({
+        type: "runtime.credential_broker_environment",
+        data: { url: credentialUrl, capabilityConfigured: true },
+      });
       if (run.workflowId) {
-        const brokerHost = ["0.0.0.0", "::", ""].includes(config.server.host) ? "127.0.0.1" : config.server.host;
         environment.GERRY_DEPENDENCY_URL = `http://${brokerHost}:${config.server.port}/agent/dependencies`;
-        environment.GERRY_AGENT_TOKEN = capability;
-        store.setAgentCapability(run.id, createHash("sha256").update(capability).digest("hex"), workerId);
         recorder.emit({
           type: "runtime.broker_environment",
           data: {
-            url: environment.GERRY_DEPENDENCY_URL ?? null,
-            capabilityConfigured: Boolean(environment.GERRY_AGENT_TOKEN),
+            url: environment.GERRY_DEPENDENCY_URL,
+            capabilityConfigured: true,
           },
         });
       }
@@ -306,6 +324,13 @@ export class WorkerPool {
     } finally {
       if (heartbeat) clearInterval(heartbeat);
       recorder?.emit({ type: "run.attempt.finished", data: { status: store.getRun(run.id).status } });
+      if (credentialDirectory) {
+        try {
+          rmSync(credentialDirectory, { recursive: true, force: true });
+        } catch (error) {
+          logger.warn("credential.wrapper_cleanup_failed", { runId: run.id, error: compactError(error) });
+        }
+      }
       writeRunSummary(store.dataDirectory, store.getRun(run.id));
     }
   }

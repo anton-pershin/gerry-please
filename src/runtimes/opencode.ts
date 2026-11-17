@@ -292,7 +292,7 @@ export class OpenCodeRuntime implements AgentRuntime {
       if (sessionId) {
         const sanitized = Object.fromEntries(
           Object.entries(input.environment).filter(
-            ([name]) => !["GH_TOKEN", "GITHUB_TOKEN", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GERRY_AGENT_TOKEN"].includes(name),
+            ([name]) => !["GH_TOKEN", "GITHUB_TOKEN", "GERRY_AGENT_TOKEN"].includes(name) && !name.startsWith("GIT_CONFIG_"),
           ),
         );
         try {

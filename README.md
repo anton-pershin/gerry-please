@@ -43,7 +43,7 @@ HMAC verification → raw delivery file → SQLite delivery/dedup record
                                      │                │
                                      └───────┬────────┘
                                              ▼
-                             worktree + installation token + prompt
+                             worktree + brokered credentials + prompt
                                              │
                                              ▼
                          comments, labels, specs, commits, and PRs
@@ -116,7 +116,7 @@ Subscribe to **Issues**, **Issue comments**, **Pull requests**, **Pull request r
 https://your-public-endpoint.example/webhooks/github
 ```
 
-Use the same webhook secret in GitHub and `GITHUB_WEBHOOK_SECRET`. Install the App only on intended repositories. Gerry binds to `127.0.0.1` by default; expose it through a TLS reverse proxy rather than changing it to a public unencrypted listener. Expose only `/webhooks/github` and optionally `/health` through that proxy—never expose `/agent/dependencies`; it is a loopback agent broker.
+Use the same webhook secret in GitHub and `GITHUB_WEBHOOK_SECRET`. Install the App only on intended repositories. Gerry binds to `127.0.0.1` by default; expose it through a TLS reverse proxy rather than changing it to a public unencrypted listener. Expose only `/webhooks/github` and optionally `/health` through that proxy—never expose `/agent/` endpoints; they are loopback agent brokers.
 
 ## Run
 
@@ -236,7 +236,7 @@ See [docs/operations.md](docs/operations.md) for recovery procedures.
 - `workspace: shared` is a convention for non-coding agents, not enforced read-only access. A conversation group cannot mix shared and worktree agents. Use runtime permissions/deny rules and Hermes write restrictions as defense in depth.
 - OpenCode `ask` requests are rejected automatically. Hermes runs without `--yolo`; configure unattended/single-query approvals to `deny` and use explicit profile allowlists.
 - Only baseline environment variables and per-agent `pass_environment` entries are forwarded. Allowlisting a provider key also makes it available to agent-invoked shell commands.
-- Agents receive `GH_TOKEN`/`GITHUB_TOKEN` and a Git credential helper. Each token is requested only for the event’s repository, expires automatically, and is never intentionally logged; its permissions still come from the App installation. Cross-repository dependency issues are created by Gerry through a per-run capability broker and exact repository allowlist, not by giving agents broader tokens.
+- Agents receive `GH_TOKEN`/`GITHUB_TOKEN` plus per-run `gh` and Git credential wrappers. New commands can obtain fresh tokens through the loopback credential broker while the run is active. Every token is scoped only to the event’s repository, expires automatically, and is never intentionally logged; its permissions still come from the App installation. Cross-repository dependency issues use the same kind of per-run capability with an exact repository allowlist, not broader agent credentials.
 - Delivery ingestion and run creation are idempotent. Incomplete dispatch is resumed on redelivery/startup without duplicating existing rules. Arbitrary agent side effects are **not exactly-once**. Inspect GitHub before retrying or resolving a failed runtime attempt.
 - A crash marks active runs `interrupted`; it never blindly resumes them. Ambiguous failures retain rule ledgers and quarantine conversations. An external runtime may still have completed work after the crash.
 - Configuration changes require restart. There is no GUI, distributed queue, automatic worktree deletion, or automatic approval interface.

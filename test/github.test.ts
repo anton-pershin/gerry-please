@@ -123,6 +123,7 @@ describe("GitHub integration", () => {
     expect(environment.GITHUB_APP_PRIVATE_KEY_PATH).toBeUndefined();
     expect(environment.GH_TOKEN).toBe("installation-token");
     expect(environment.GH_CONFIG_DIR).toContain("run_1");
-    expect(environment.GIT_CONFIG_VALUE_0).toContain("$GH_TOKEN");
+    expect(environment.GIT_CONFIG_VALUE_0).toBe("");
+    expect(environment.GIT_CONFIG_VALUE_1).toContain("$GH_TOKEN");
   });
 });

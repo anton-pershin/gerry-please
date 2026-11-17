@@ -140,7 +140,13 @@ describe("OpenCode client adapter", () => {
         options: { agent: "build" },
         prompt: "Review the issue",
         workspacePath: workspace,
-        environment: { GH_TOKEN: "secret", GITHUB_TOKEN: "secret", PATH: "/bin", GIT_CONFIG_VALUE_0: "secret-helper" },
+        environment: {
+          GH_TOKEN: "secret",
+          GITHUB_TOKEN: "secret",
+          PATH: "/bin",
+          GIT_CONFIG_VALUE_0: "secret-helper",
+          GIT_CONFIG_VALUE_1: "another-secret-helper",
+        },
         existingSessionId: null,
         attemptDirectory: attempt,
         timeoutMs: 5000,
@@ -161,6 +167,7 @@ describe("OpenCode client adapter", () => {
       expect(fake.environmentCalls.at(-1)?.GH_TOKEN).toBeUndefined();
       expect(fake.environmentCalls.at(-1)?.GITHUB_TOKEN).toBeUndefined();
       expect(fake.environmentCalls.at(-1)?.GIT_CONFIG_VALUE_0).toBeUndefined();
+      expect(fake.environmentCalls.at(-1)?.GIT_CONFIG_VALUE_1).toBeUndefined();
       expect(events.some((event) => event.type === "opencode.snapshot.session")).toBe(true);
     } finally {
       rmSync(directory, { recursive: true, force: true });

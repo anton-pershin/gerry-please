@@ -60,6 +60,12 @@ Every matching review turn resumes the same compatibility-checked agent session 
 
 Workflow failures use the same conservative semantics as conversations: ambiguous failures retain ledgers and quarantine only the affected workflow. Retry/resolution is quarantine-owner checked and cannot clear a newer run’s quarantine.
 
+## Agent GitHub credentials
+
+Workspace preparation still uses an installation token acquired before Git worktree operations. Agent commands additionally receive a per-run capability and a temporary wrapper directory on `PATH`. The `gh` wrapper obtains a token from the loopback `/agent/github/token` endpoint immediately before starting the real CLI. Git's credential helper does the same for each authentication request. The endpoint derives installation and repository identity from the active run, returns a non-cacheable plain-text token, and never accepts a target repository from the agent. Capabilities are stored only as hashes and are invalidated when execution finishes. Wrapper files contain no credentials and are removed after the attempt. Host credential helpers are cleared before the brokered Git helper is installed.
+
+This refreshes credentials between commands, not within an existing process. Long-running watches should be split into bounded repeated invocations so each invocation can obtain fresh credentials. Dynamic tokens use GitHub's recognized token shapes and are covered by the attempt redactor; credential responses and broker failures are not written to runtime event logs.
+
 ## Cross-repository dependencies
 
 Workflow agents do not receive cross-repository credentials. During an active run they receive a random per-run capability and loopback broker URL. The broker hashes and validates that capability against the active run, checks an exact `from`/`to` dependency policy, and only then creates an issue using an installation token scoped to the target repository. The App private key remains in the daemon.
@@ -106,7 +112,7 @@ Shared runs use the configured canonical checkout. Worktree runs fetch the confi
 
 Worktrees and branches are not automatically removed. This preserves uncommitted changes, unpushed commits, and forensic evidence.
 
-The GitHub App provides short-lived installation tokens scoped to the event’s repository and cached per installation/repository. The same token authenticates worktree fetches and agent Git/GitHub operations. Dependency creation uses a separate target-scoped token inside the daemon after an explicit policy check. Per-run broker capabilities are stored only as hashes and invalidated when execution finishes. A sanitized process environment adds `GH_TOKEN`, `GITHUB_TOKEN`, noninteractive Git settings, and a credential helper that reads the token from the environment. Private App key material and webhook secrets are not included in prompts or agent environments.
+The GitHub App provides short-lived installation tokens scoped to the event’s repository and cached per installation/repository. An initial token authenticates worktree setup; agent Git/GitHub commands use the capability-checked credential broker to obtain tokens while the run is active. Dependency creation uses a separate target-scoped token inside the daemon after an explicit policy check. Per-run broker capabilities are stored only as hashes and invalidated when execution finishes. A sanitized process environment adds noninteractive Git settings and isolated helper configuration. Private App key material and webhook secrets are not included in prompts or agent environments.
 
 ## Observability model
 
