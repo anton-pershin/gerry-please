@@ -21,6 +21,18 @@ describe("configuration", () => {
     expect(readPrompt(fixture.config, "task.md").hash).toHaveLength(64);
   });
 
+  test("uses a dedicated OpenCode service by default", () => {
+    const fixture = configFixture();
+    directories.push(fixture.directory);
+    const path = join(fixture.directory, "gerry.yaml");
+    const raw = parse(readFileSync(path, "utf8")) as any;
+    raw.runtimes.opencode = { type: "opencode" };
+    raw.agents.implementer.runtime = "opencode";
+    writeFileSync(path, stringify(raw));
+    const config = loadConfig(path);
+    expect(config.runtimes.opencode).toMatchObject({ type: "opencode", dedicated_service: true });
+  });
+
   test("rejects duplicate rules and unknown agents", () => {
     const fixture = configFixture();
     directories.push(fixture.directory);

@@ -11,7 +11,7 @@ import {
   type ListOpenCodeBackgroundJobs,
   type OpenCodeBackgroundJob,
 } from "../src/runtimes/opencode.ts";
-import { ProviderQuotaError } from "../src/runtimes/types.ts";
+import { ProviderQuotaError, RuntimeExecutionError } from "../src/runtimes/types.ts";
 import type { RuntimeEvent } from "../src/types.ts";
 import { temporaryDirectory } from "./helpers.ts";
 
@@ -143,12 +143,13 @@ async function runExistingSession(
   directory: string,
   sessionID: string,
   listBackgroundJobs: ListOpenCodeBackgroundJobs = async () => [],
+  recovery: ConstructorParameters<typeof OpenCodeRuntime>[3] = {},
 ): Promise<unknown> {
   const workspace = join(directory, "workspace");
   const attempt = join(directory, "attempt");
   mkdirSync(workspace, { recursive: true });
   mkdirSync(attempt, { recursive: true });
-  const runtime = new OpenCodeRuntime(fake.client, "fake", listBackgroundJobs);
+  const runtime = new OpenCodeRuntime(fake.client, "fake", listBackgroundJobs, recovery);
   try {
     return await runtime.run({
       runId: "run_quota",
@@ -190,6 +191,8 @@ describe("OpenCode client adapter", () => {
           GH_TOKEN: "secret",
           GITHUB_TOKEN: "secret",
           PATH: "/bin",
+          GIT_CONFIG_GLOBAL: "/managed/run/gitconfig",
+          GIT_CONFIG_NOSYSTEM: "1",
           GIT_CONFIG_VALUE_0: "secret-helper",
           GIT_CONFIG_VALUE_1: "another-secret-helper",
         },
@@ -212,8 +215,11 @@ describe("OpenCode client adapter", () => {
       expect(fake.environmentCalls[2]?.GH_TOKEN).toBe("secret");
       expect(fake.environmentCalls.at(-1)?.GH_TOKEN).toBeUndefined();
       expect(fake.environmentCalls.at(-1)?.GITHUB_TOKEN).toBeUndefined();
-      expect(fake.environmentCalls.at(-1)?.GIT_CONFIG_VALUE_0).toBeUndefined();
+      expect(fake.environmentCalls.at(-1)?.GIT_CONFIG_KEY_0).toBe("credential.helper");
+      expect(fake.environmentCalls.at(-1)?.GIT_CONFIG_VALUE_0).toBe("");
       expect(fake.environmentCalls.at(-1)?.GIT_CONFIG_VALUE_1).toBeUndefined();
+      expect(fake.environmentCalls.at(-1)?.GIT_CONFIG_GLOBAL).toBe("/managed/run/gitconfig");
+      expect(fake.environmentCalls.at(-1)?.GIT_CONFIG_NOSYSTEM).toBe("1");
       expect(events.some((event) => event.type === "opencode.snapshot.session")).toBe(true);
     } finally {
       rmSync(directory, { recursive: true, force: true });
@@ -229,6 +235,60 @@ describe("OpenCode client adapter", () => {
       expect((thrown as ProviderQuotaError).details.sessionId).toBe("quota-session");
       expect((thrown as ProviderQuotaError).message).toContain("5-hour usage limit");
       expect(fake.environmentCalls.at(-1)?.GH_TOKEN).toBeUndefined();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("reconnects after a disconnect and interrupts the complete session tree before cleanup", async () => {
+    const directory = temporaryDirectory();
+    const root = "disconnect-session";
+    const child = "disconnect-child";
+    try {
+      const initial = fakeClient(root);
+      Object.assign(initial.client.event, {
+        subscribe: async function* () {
+          yield { type: "server.connected", data: {} };
+          throw new Error("ECONNRESET");
+        },
+      });
+      const recovered = fakeClient(
+        root,
+        undefined,
+        true,
+        0,
+        undefined,
+        "2.3.0",
+        undefined,
+        undefined,
+        undefined,
+        () => [{ id: child, parentID: root }],
+      );
+      const environmentSessionIDs: string[] = [];
+      const recordEnvironment = recovered.client.session.environment;
+      recovered.client.session.environment = async (input) => {
+        environmentSessionIDs.push(input.sessionID);
+        return recordEnvironment(input);
+      };
+      const interruptions: Array<{ sessionID: string; resume?: boolean | undefined }> = [];
+      recovered.client.session.interrupt = async (input) => {
+        interruptions.push(input);
+        return { interrupted: true };
+      };
+      const thrown = await runExistingSession(initial, directory, root, async () => [], {
+        reconnect: async () => ({ client: recovered.client, listBackgroundJobs: async () => [] }),
+        timeoutMs: 1_000,
+      });
+      expect((thrown as Error).message).toContain("event stream disconnected");
+      expect(thrown).toBeInstanceOf(RuntimeExecutionError);
+      expect(interruptions).toEqual([
+        { sessionID: root, resume: false },
+        { sessionID: child, resume: false },
+      ]);
+      expect(environmentSessionIDs).toContain(child);
+      expect(recovered.environmentCalls.length).toBeGreaterThanOrEqual(2);
+      expect(recovered.environmentCalls.at(-1)?.GH_TOKEN).toBeUndefined();
+      expect(recovered.environmentCalls.at(-1)?.GERRY_AGENT_TOKEN).toBeUndefined();
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

@@ -185,4 +185,5 @@ export interface AgentRuntime {
 export interface RuntimeFactoryContext {
   name: string;
   environment: NodeJS.ProcessEnv;
+  dataDirectory: string;
 }

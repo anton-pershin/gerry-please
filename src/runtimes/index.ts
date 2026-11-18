@@ -6,7 +6,7 @@ import { OpenCodeRuntime } from "./opencode.ts";
 export async function createRuntimes(config: LoadedConfig): Promise<Map<string, AgentRuntime>> {
   const runtimes = new Map<string, AgentRuntime>();
   for (const [name, runtimeConfig] of Object.entries(config.runtimes)) {
-    const context = { name, environment: process.env };
+    const context = { name, environment: process.env, dataDirectory: config.dataDir };
     const runtime = runtimeConfig.type === "opencode"
       ? await OpenCodeRuntime.fromConfig(context, runtimeConfig)
       : HermesRuntime.fromConfig(context, runtimeConfig);

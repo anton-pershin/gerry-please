@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
+import { GERRY_GIT_AUTHOR_EMAIL, GERRY_GIT_AUTHOR_NAME } from "./github.ts";
 import type { Logger } from "./observability.ts";
 import type { Store } from "./store.ts";
 import { compactError, withDeadline } from "./util.ts";
@@ -153,8 +154,14 @@ export function writeAgentCredentialWrappers(input: {
   mkdirSync(input.directory, { recursive: true, mode: 0o700 });
   const ghPath = join(input.directory, "gh");
   const helperPath = join(input.directory, "git-credential-gerry");
+  const gitConfigPath = join(input.directory, "gitconfig");
   writeFileSync(ghPath, ghWrapper(input), { mode: 0o700 });
   writeFileSync(helperPath, gitCredentialHelper(input), { mode: 0o700 });
+  writeFileSync(
+    gitConfigPath,
+    `[user]\n name = ${GERRY_GIT_AUTHOR_NAME}\n email = ${GERRY_GIT_AUTHOR_EMAIL}\n[credential]\n helper =\n`,
+    { mode: 0o600 },
+  );
   chmodSync(ghPath, 0o700);
   chmodSync(helperPath, 0o700);
 }
@@ -163,11 +170,31 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
+export function sanitizeAgentCredentialEnvironment(environment: Record<string, string>): Record<string, string> {
+  const sanitized = Object.fromEntries(
+    Object.entries(environment).filter(
+      ([name]) => !["GH_TOKEN", "GITHUB_TOKEN", "GERRY_AGENT_TOKEN"].includes(name) && !name.startsWith("GIT_CONFIG_"),
+    ),
+  );
+  sanitized.GIT_TERMINAL_PROMPT = "0";
+  sanitized.GIT_CONFIG_NOSYSTEM = "1";
+  sanitized.GIT_CONFIG_COUNT = "1";
+  sanitized.GIT_CONFIG_KEY_0 = "credential.helper";
+  sanitized.GIT_CONFIG_VALUE_0 = "";
+  // Keep Git pinned to the run's managed, helper-free configuration even after
+  // its broker capability and wrappers have been retired. Removing this value
+  // would silently re-enable the host's global configuration.
+  if (environment.GIT_CONFIG_GLOBAL !== undefined) sanitized.GIT_CONFIG_GLOBAL = environment.GIT_CONFIG_GLOBAL;
+  return sanitized;
+}
+
 export function applyAgentCredentialWrappers(environment: Record<string, string>, directory: string): void {
   environment.PATH = [directory, environment.PATH].filter(Boolean).join(":");
   environment.GIT_TERMINAL_PROMPT = "0";
+  environment.GIT_CONFIG_GLOBAL = join(directory, "gitconfig");
+  environment.GIT_CONFIG_NOSYSTEM = "1";
   environment.GIT_CONFIG_COUNT = "2";
-  environment.GIT_CONFIG_KEY_0 = "credential.https://github.com.helper";
+  environment.GIT_CONFIG_KEY_0 = "credential.helper";
   environment.GIT_CONFIG_VALUE_0 = "";
   environment.GIT_CONFIG_KEY_1 = "credential.https://github.com.helper";
   environment.GIT_CONFIG_VALUE_1 = `!${shellQuote(join(directory, "git-credential-gerry"))}`;

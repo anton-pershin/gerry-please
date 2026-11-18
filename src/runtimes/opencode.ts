@@ -2,8 +2,10 @@ import { ClientError, OpenCode, type OpenCodeClient, type OpenCodeEvent } from "
 import { Service } from "@opencode/client/service";
 import { z } from "zod";
 import type { RuntimeConfig } from "../config.ts";
+import { sanitizeAgentCredentialEnvironment } from "../credentials.ts";
 import type { AgentRuntime, RuntimeFactoryContext, RuntimeResult, RuntimeRunInput, Usage } from "../types.ts";
 import { compactError, parseModel, sleep, withDeadline } from "../util.ts";
+import { prepareIsolatedOpenCodeService } from "./opencode-service.ts";
 import { ProviderQuotaError, RuntimeExecutionError } from "./types.ts";
 
 const optionsSchema = z
@@ -64,11 +66,18 @@ export function isSupportedOpenCodeVersion(version: string): boolean {
   return major > 2 || (major === 2 && minor >= 3);
 }
 
-function makeRuntime(name: string, baseUrl: string, headers?: RequestInit["headers"]): OpenCodeRuntime {
+interface OpenCodeConnection {
+  client: OpenCodeClient;
+  listBackgroundJobs: ListOpenCodeBackgroundJobs;
+}
+
+type OpenCodeConnector = () => Promise<OpenCodeConnection>;
+
+function makeConnection(baseUrl: string, headers?: RequestInit["headers"]): OpenCodeConnection {
   const options: { baseUrl: string; headers?: RequestInit["headers"] } = { baseUrl };
   if (headers) options.headers = headers;
   const client = OpenCode.make(options);
-  return new OpenCodeRuntime(client, name, createOpenCodeBackgroundJobLister(client));
+  return { client, listBackgroundJobs: createOpenCodeBackgroundJobLister(client) };
 }
 
 const COLLECTION_COMPLETE = "OpenCode event collection complete";
@@ -282,26 +291,43 @@ export class OpenCodeRuntime implements AgentRuntime {
   readonly type = "opencode" as const;
 
   constructor(
-    private readonly client: OpenCodeClient,
+    private client: OpenCodeClient,
     readonly name: string,
-    private readonly listBackgroundJobs: ListOpenCodeBackgroundJobs,
+    private listBackgroundJobs: ListOpenCodeBackgroundJobs,
+    private readonly recovery: {
+      reconnect?: OpenCodeConnector;
+      timeoutMs?: number;
+    } = {},
   ) {}
 
   static async fromConfig(
     context: RuntimeFactoryContext,
     config: Extract<RuntimeConfig, { type: "opencode" }>,
   ): Promise<OpenCodeRuntime> {
+    let connect: OpenCodeConnector;
     if (config.base_url) {
       const token = config.token_env ? context.environment[config.token_env] : undefined;
       if (config.token_env && !token) throw new Error(`Missing OpenCode token environment variable: ${config.token_env}`);
-      return makeRuntime(
-        context.name,
-        config.base_url,
-        token ? { authorization: `Bearer ${token}` } : undefined,
-      );
+      const headers = token ? { authorization: `Bearer ${token}` } : undefined;
+      connect = async () => makeConnection(config.base_url!, headers);
+    } else if (config.dedicated_service) {
+      const service = prepareIsolatedOpenCodeService(context.dataDirectory);
+      connect = async () => {
+        const endpoint = await Service.ensure({
+          file: service.registrationFile,
+          command: [service.launcherPath],
+          version: isSupportedOpenCodeVersion,
+        });
+        return makeConnection(endpoint.url, Service.headers(endpoint));
+      };
+    } else {
+      connect = async () => {
+        const endpoint = await Service.ensure({ version: isSupportedOpenCodeVersion });
+        return makeConnection(endpoint.url, Service.headers(endpoint));
+      };
     }
-    const endpoint = await Service.ensure({ version: isSupportedOpenCodeVersion });
-    return makeRuntime(context.name, endpoint.url, Service.headers(endpoint));
+    const connection = await connect();
+    return new OpenCodeRuntime(connection.client, context.name, connection.listBackgroundJobs, { reconnect: connect });
   }
 
   async check(): Promise<void> {
@@ -309,6 +335,130 @@ export class OpenCodeRuntime implements AgentRuntime {
     if (!isSupportedOpenCodeVersion(info.version)) {
       throw new Error(`OpenCode server ${info.version} is unsupported; Gerry requires OpenCode >= 2.3.0`);
     }
+  }
+
+  private async recoverFailedSession(sessionID: string, input: RuntimeRunInput): Promise<void> {
+    const timeoutMs = this.recovery.timeoutMs ?? 15_000;
+    const deadline = Date.now() + timeoutMs;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(new Error("OpenCode recovery timed out")), timeoutMs);
+    const abort = () => controller.abort(input.signal.reason);
+    input.signal.addEventListener("abort", abort, { once: true });
+    const signal = controller.signal;
+    const remaining = () => Math.max(1, deadline - Date.now());
+    let lastError: unknown;
+    let reconnecting: Promise<OpenCodeConnection> | undefined;
+    try {
+      while (Date.now() < deadline && !signal.aborted) {
+        try {
+          if (this.recovery.reconnect) {
+            reconnecting ??= this.recovery.reconnect().then(
+              (connection) => {
+                reconnecting = undefined;
+                return connection;
+              },
+              (error) => {
+                reconnecting = undefined;
+                throw error;
+              },
+            );
+            const connection = await withDeadline(
+              reconnecting,
+              Math.min(5_000, remaining()),
+              "OpenCode reconnection timed out",
+            );
+            this.client = connection.client;
+            this.listBackgroundJobs = connection.listBackgroundJobs;
+          }
+          await withDeadline(this.check(), remaining(), "OpenCode recovery health check timed out");
+
+          // Revoke the run environment before stopping execution so a late tool
+          // call cannot use the old capability while recovery is in progress.
+          await withDeadline(this.client.session.environment({
+            sessionID,
+            variables: sanitizeAgentCredentialEnvironment(input.environment),
+          }, { signal }), remaining(), "OpenCode recovery environment cleanup timed out");
+
+          let sessionIDs = [sessionID];
+          let treeError: unknown;
+          try {
+            sessionIDs = await listOpenCodeSessionTree(this.client, sessionID, signal);
+          } catch (error) {
+            treeError = error;
+          }
+          const cleanups = await Promise.allSettled(sessionIDs.map((id) => withDeadline(
+            this.client.session.environment({
+              sessionID: id,
+              variables: sanitizeAgentCredentialEnvironment(input.environment),
+            }, { signal }),
+            remaining(),
+            `OpenCode recovery environment cleanup timed out for ${id}`,
+          )));
+          const interruptions = await Promise.allSettled(sessionIDs.map((id) => withDeadline(
+            this.client.session.interrupt({ sessionID: id, resume: false }, { signal }),
+            remaining(),
+            `OpenCode interruption timed out for ${id}`,
+          )));
+          if (treeError) throw treeError;
+          const failedCleanup = cleanups.find((result) => result.status === "rejected");
+          if (failedCleanup) {
+            throw failedCleanup.status === "rejected" ? failedCleanup.reason : new Error("OpenCode recovery environment cleanup failed");
+          }
+          const failedInterruption = interruptions.find((result) => result.status === "rejected");
+          if (failedInterruption) {
+            throw failedInterruption.status === "rejected" ? failedInterruption.reason : new Error("OpenCode interruption failed");
+          }
+
+          const sessionsAfter = await listOpenCodeSessionTree(this.client, sessionID, signal);
+          const newSessionIDs = sessionsAfter.filter((id) => !sessionIDs.includes(id));
+          if (newSessionIDs.length > 0) {
+            await Promise.allSettled(newSessionIDs.map((id) => withDeadline(
+              this.client.session.environment({
+                sessionID: id,
+                variables: sanitizeAgentCredentialEnvironment(input.environment),
+              }, { signal }),
+              remaining(),
+              `OpenCode recovery environment cleanup timed out for ${id}`,
+            )));
+            await Promise.allSettled(newSessionIDs.map((id) => withDeadline(
+              this.client.session.interrupt({ sessionID: id, resume: false }, { signal }),
+              remaining(),
+              `OpenCode interruption timed out for ${id}`,
+            )));
+            throw new Error("OpenCode session tree changed during recovery");
+          }
+          const jobs = await this.listBackgroundJobs(sessionID, signal);
+          const active = await this.client.session.active({ signal });
+          const activeSessionIDs = sessionsAfter.filter((id) => active[id]);
+          const runningJobIDs = jobs.filter((job) => job.status === "running").map((job) => job.id);
+          input.emit({
+            type: "opencode.recovery.interrupted",
+            data: { sessionIDs, activeSessionIDs, runningJobIDs },
+          });
+          return;
+        } catch (error) {
+          lastError = error;
+          if (Date.now() >= deadline || signal.aborted) break;
+          input.emit({
+            type: "opencode.recovery.reconnecting",
+            data: { error: compactError(error) },
+          });
+          try {
+            await sleep(250, signal);
+          } catch (sleepError) {
+            lastError = sleepError;
+            break;
+          }
+        }
+      }
+    } finally {
+      clearTimeout(timeout);
+      input.signal.removeEventListener("abort", abort);
+    }
+    input.emit({
+      type: "opencode.recovery.failed",
+      data: { error: compactError(lastError ?? "OpenCode recovery timed out") },
+    });
   }
 
   async run(input: RuntimeRunInput): Promise<RuntimeResult> {
@@ -325,7 +475,6 @@ export class OpenCodeRuntime implements AgentRuntime {
     let streamedText = "";
     let executionError: unknown;
     let usage: Usage | undefined;
-    let executionIdle = false;
     let eventPump: Promise<void> | undefined;
     let previousMessageId: string | null = null;
 
@@ -422,7 +571,6 @@ export class OpenCodeRuntime implements AgentRuntime {
         getSessionGeneration: (sessionID) => readOpenCodeSessionGeneration(this.client, sessionID, signal),
         emit: input.emit,
       });
-      executionIdle = true;
       const session = await this.client.session.get({ sessionID: sessionId }, { signal });
       usage = {
         inputTokens: session.tokens.input,
@@ -455,17 +603,7 @@ export class OpenCodeRuntime implements AgentRuntime {
       }
       return { sessionId, response: responseFromMessages(messages) || streamedText, ...(usage ? { usage } : {}) };
     } catch (error) {
-      if (sessionId && !executionIdle) {
-        try {
-          await withDeadline(
-            this.client.session.interrupt({ sessionID: sessionId }),
-            5_000,
-            "OpenCode interruption timed out",
-          );
-        } catch (interruptError) {
-          input.emit({ type: "opencode.cleanup.interrupt_failed", data: { error: compactError(interruptError) } });
-        }
-      }
+      if (sessionId) await this.recoverFailedSession(sessionId, input);
       if (error instanceof RuntimeExecutionError) throw error;
       throw new RuntimeExecutionError(compactError(error), {
         ...(sessionId ? { sessionId } : {}),
@@ -485,14 +623,9 @@ export class OpenCodeRuntime implements AgentRuntime {
         }
       }
       if (sessionId) {
-        const sanitized = Object.fromEntries(
-          Object.entries(input.environment).filter(
-            ([name]) => !["GH_TOKEN", "GITHUB_TOKEN", "GERRY_AGENT_TOKEN"].includes(name) && !name.startsWith("GIT_CONFIG_"),
-          ),
-        );
         try {
           await withDeadline(
-            this.client.session.environment({ sessionID: sessionId, variables: sanitized }),
+            this.client.session.environment({ sessionID: sessionId, variables: sanitizeAgentCredentialEnvironment(input.environment) }),
             5_000,
             "OpenCode credential cleanup timed out",
           );
