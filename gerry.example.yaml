@@ -21,7 +21,9 @@ repositories:
 runtimes:
   opencode-local:
     type: opencode
-    # Omit base_url to discover/start the local OpenCode V2 service.
+    # Default true: run a Gerry-owned isolated OpenCode V2 service and database.
+    dedicated_service: true
+    # Optional explicit external server instead of the dedicated local service.
     # base_url: http://127.0.0.1:4096
     # token_env: OPENCODE_TOKEN
   hermes-local:

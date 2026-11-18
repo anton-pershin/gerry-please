@@ -29,6 +29,7 @@ const runtimeSchema = z.discriminatedUnion("type", [
       type: z.literal("opencode"),
       base_url: z.url().optional(),
       token_env: z.string().min(1).optional(),
+      dedicated_service: z.boolean().default(true),
     })
     .strict(),
   z

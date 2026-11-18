@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { chmodSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   AgentCredentialService,
   applyAgentCredentialWrappers,
+  sanitizeAgentCredentialEnvironment,
   writeAgentCredentialWrappers,
 } from "../src/credentials.ts";
 import { readPrompt } from "../src/config.ts";
@@ -161,8 +162,12 @@ describe("agent GitHub credentials", () => {
       environment.GIT_CONFIG_GLOBAL = hostGitConfig;
       applyAgentCredentialWrappers(environment, wrapperDirectory);
       expect(environment.PATH).toBe(`${wrapperDirectory}:/usr/bin:/bin`);
+      expect(environment.GIT_CONFIG_GLOBAL).toBe(join(wrapperDirectory, "gitconfig"));
+      expect(environment.GIT_CONFIG_GLOBAL).not.toBe(hostGitConfig);
+      expect(environment.GIT_CONFIG_KEY_0).toBe("credential.helper");
       expect(environment.GIT_CONFIG_VALUE_0).toBe("");
       expect(environment.GIT_CONFIG_VALUE_1).toContain(join(wrapperDirectory, "git-credential-gerry"));
+      expect(readFileSync(environment.GIT_CONFIG_GLOBAL, "utf8")).toContain("name = gerry-please[bot]");
 
       const ghPath = join(wrapperDirectory, "gh");
       const first = await execute(ghPath, ["pr", "view", "5"], environment);
@@ -186,10 +191,55 @@ describe("agent GitHub credentials", () => {
       expect(git.status).toBe(0);
       expect(git.stderr).toBe("");
       expect(git.stdout).toContain("password=ghs_wrapper_token_5_");
+
+      const sanitized = sanitizeAgentCredentialEnvironment({
+        ...environment,
+        GH_TOKEN: "retired-token",
+        GIT_CONFIG_GLOBAL: hostGitConfig,
+      });
+      expect(sanitized.GH_TOKEN).toBeUndefined();
+      expect(sanitized.GERRY_AGENT_TOKEN).toBeUndefined();
+      expect(sanitized.GIT_CONFIG_VALUE_0).toBe("");
+      const withoutBroker = await execute("git", ["credential", "fill"], sanitized, input);
+      expect(withoutBroker.status).not.toBe(0);
+      expect(withoutBroker.stdout).not.toContain("host-password");
+      expect(withoutBroker.stderr).not.toContain("host-password");
+
       expect(requests).toEqual(Array.from({ length: 5 }, () => ({
         runId: "run_test",
         capability: "Bearer test-capability",
       })));
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("never invokes the real gh when the broker rejects a run", async () => {
+    const directory = temporaryDirectory();
+    directories.push(directory);
+    const markerPath = join(directory, "real-gh-called");
+    const realGhPath = join(directory, "real-gh");
+    writeFileSync(realGhPath, `#!/bin/sh\ntouch ${JSON.stringify(markerPath)}\n`, { mode: 0o700 });
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: () => new Response("expired", { status: 401 }),
+    });
+    try {
+      const wrapperDirectory = join(directory, "bin");
+      writeAgentCredentialWrappers({
+        directory: wrapperDirectory,
+        runId: "run_expired",
+        credentialUrl: `http://127.0.0.1:${server.port}/agent/github/token`,
+        realGhPath,
+      });
+      const result = await execute(join(wrapperDirectory, "gh"), ["pr", "comment", "14"], {
+        ...process.env,
+        GERRY_AGENT_TOKEN: "expired-capability",
+      });
+      expect(result.status).toBe(1);
+      expect(existsSync(markerPath)).toBe(false);
+      expect(result.stderr).toContain("could not obtain GitHub credentials");
     } finally {
       server.stop(true);
     }

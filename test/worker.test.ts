@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { readPrompt, type RuleConfig } from "../src/config.ts";
 import { Logger } from "../src/observability.ts";
@@ -86,6 +86,9 @@ describe("worker execution", () => {
   test("runs an agent and writes redacted audit artifacts", async () => {
     const fixture = setup(async (input) => {
       input.emit({ type: "fake.secret", data: { output: input.environment.GH_TOKEN } });
+      const ghConfigDirectory = input.environment.GH_CONFIG_DIR!;
+      mkdirSync(ghConfigDirectory, { recursive: true });
+      writeFileSync(join(ghConfigDirectory, "hosts.yml"), "test-state");
       return { sessionId: "session-1", response: `Done with ${input.environment.GH_TOKEN}` };
     });
     enqueue(fixture, fixture.store);
@@ -107,6 +110,7 @@ describe("worker execution", () => {
     const wrapperDirectory = environment.PATH?.split(":")[0];
     expect(wrapperDirectory).toBeDefined();
     expect(existsSync(wrapperDirectory!)).toBe(false);
+    expect(existsSync(environment.GH_CONFIG_DIR!)).toBe(false);
     expect(run.agentCapabilityHash).toBeNull();
     const events = readFileSync(join(fixture.config.dataDir, "runs", run.id, "attempts", "1", "events.jsonl"), "utf8");
     const response = readFileSync(join(fixture.config.dataDir, "runs", run.id, "response.md"), "utf8");

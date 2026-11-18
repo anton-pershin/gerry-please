@@ -43,13 +43,19 @@ The checkout must be a Git repository with an `origin` remote for worktree runs.
 runtimes:
   opencode:
     type: opencode
-    # Optional. Omit to discover/start the local V2 service.
+    # Default true: use a Gerry-owned isolated local service.
+    dedicated_service: true
+    # Optional explicit external server instead of the dedicated local service.
     base_url: http://127.0.0.1:4096
     # Optional bearer token variable for an explicit server.
     token_env: OPENCODE_TOKEN
 ```
 
-OpenCode **2.3.0 or newer** is required. Gerry checks this during local service discovery, integration checks, and every run before prompt admission. A run does not complete merely because its parent session is idle: Gerry waits for all descendant subagents, every tracked shell job, and their completion reports. It also revalidates the complete descendant tree on both sides of the check, requiring unchanged membership and server-authoritative durable log watermarks, no active execution anywhere in the tree, and empty jobs/inbox so a consumed report, active child, or newly created job cannot slip through a stale snapshot and wake a session after credential cleanup. Persistent services such as report servers must be launched by a foreground command that detaches them with `nohup` and redirected stdin/stdout/stderr; do not leave them as tracked OpenCode background jobs.
+With `dedicated_service: true`, Gerry starts or reuses its own OpenCode service under `<data_dir>/opencode-service/`. It has a dedicated registration file, service configuration, dynamic loopback port, and database. It does not discover, replace, or restart the user's normal OpenCode service. Personal `gh` configuration, GitHub token environment variables, host Git configuration, and host credential helpers are not inherited. Ordinary non-service OpenCode resources such as agents, commands, skills, plugins, and instructions are linked without copying the user's service port, password, or saved service environment.
+
+On first startup, an existing OpenCode database can supply a one-time snapshot of provider credential tables so model access continues to work. Sessions, messages, jobs, inboxes, automation, and event history are removed from the copy; the original database is never modified. The new service therefore has no existing session it can resume. Enabling the dedicated service changes the runtime compatibility identity, so existing workflows deliberately start fresh runtime sessions while retaining their worktrees, branches, and GitHub discussions. `dedicated_service: false` is a legacy escape hatch that reuses the user's shared service and does not provide this isolation.
+
+An explicit `base_url` bypasses local service management. The external server must provide equivalent protection against fallback to personal `gh` and Git credentials. OpenCode **2.3.0 or newer** is required in all modes. Gerry checks this during local service discovery, integration checks, and every run before prompt admission. A run does not complete merely because its parent session is idle: Gerry waits for all descendant subagents, every tracked shell job, and their completion reports. It also revalidates the complete descendant tree on both sides of the check, requiring unchanged membership and server-authoritative durable log watermarks, no active execution anywhere in the tree, and empty jobs/inbox so a consumed report, active child, or newly created job cannot slip through a stale snapshot and wake a session after credential cleanup. Persistent services such as report servers must be launched by a foreground command that detaches them with `nohup` and redirected stdin/stdout/stderr; do not leave them as tracked OpenCode background jobs.
 
 ### Hermes
 
@@ -94,7 +100,7 @@ Unknown runtime options are errors. Gerry does not expose a `yolo` option.
 
 ### Agent GitHub credentials
 
-No additional configuration is required. Gerry places a temporary `gh` wrapper and Git credential helper on each run's command path. New commands use the loopback `/agent/github/token` broker to obtain same-repository installation tokens while the run is active. The broker uses the run's capability and stored identity; agents cannot select another repository. The wrapper directory is removed and the capability invalidated after the attempt. An individual long-running process keeps its starting token, so use repeated bounded checks rather than a single watch that outlives the token.
+No additional configuration is required. Gerry places a temporary `gh` wrapper, Git credential helper, and managed Git configuration on each run's command path. New commands use the loopback `/agent/github/token` broker to obtain same-repository installation tokens while the run is active. The broker uses the run's capability and stored identity; agents cannot select another repository. Commits use the explicit `gerry-please[bot]` author and committer identity rather than the host Git identity. The wrapper and run-specific `gh` configuration directories are removed and the capability is invalidated after the attempt. Cleanup retains a helper-free Git configuration, so later commands cannot silently fall back to a host credential helper. An individual long-running process keeps its starting token, so use repeated bounded checks rather than a single watch that outlives the token.
 
 ## `rules`
 

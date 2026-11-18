@@ -304,13 +304,26 @@ const DEFAULT_ENVIRONMENT = [
   "no_proxy",
 ];
 
+export const GERRY_GIT_AUTHOR_NAME = "gerry-please[bot]";
+export const GERRY_GIT_AUTHOR_EMAIL = "gerry-please[bot]@users.noreply.github.com";
+
+export function gitIdentityEnvironment(): Record<string, string> {
+  return {
+    GIT_AUTHOR_NAME: GERRY_GIT_AUTHOR_NAME,
+    GIT_AUTHOR_EMAIL: GERRY_GIT_AUTHOR_EMAIL,
+    GIT_COMMITTER_NAME: GERRY_GIT_AUTHOR_NAME,
+    GIT_COMMITTER_EMAIL: GERRY_GIT_AUTHOR_EMAIL,
+  };
+}
+
 export function gitCredentialEnvironment(token: string): Record<string, string> {
   return {
     GH_TOKEN: token,
     GITHUB_TOKEN: token,
+    ...gitIdentityEnvironment(),
     GIT_TERMINAL_PROMPT: "0",
     GIT_CONFIG_COUNT: "2",
-    GIT_CONFIG_KEY_0: "credential.https://github.com.helper",
+    GIT_CONFIG_KEY_0: "credential.helper",
     GIT_CONFIG_VALUE_0: "",
     GIT_CONFIG_KEY_1: "credential.https://github.com.helper",
     GIT_CONFIG_VALUE_1: "!f() { echo username=x-access-token; echo password=\"$GH_TOKEN\"; }; f",

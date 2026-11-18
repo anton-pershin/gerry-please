@@ -104,7 +104,16 @@ describe("GitHub integration", () => {
 
   test("only forwards explicitly allowed process environment variables", () => {
     const { config } = configFixture();
-    const agent = { ...config.agents.implementer!, pass_environment: ["MODEL_API_KEY"] };
+    const agent = {
+      ...config.agents.implementer!,
+      pass_environment: ["MODEL_API_KEY"],
+      env: {
+        GIT_AUTHOR_NAME: "host-user",
+        GIT_AUTHOR_EMAIL: "host@example.com",
+        GIT_COMMITTER_NAME: "host-user",
+        GIT_COMMITTER_EMAIL: "host@example.com",
+      },
+    };
     const environment = buildAgentEnvironment({
       agent,
       token: "installation-token",
@@ -123,6 +132,10 @@ describe("GitHub integration", () => {
     expect(environment.GITHUB_APP_PRIVATE_KEY_PATH).toBeUndefined();
     expect(environment.GH_TOKEN).toBe("installation-token");
     expect(environment.GH_CONFIG_DIR).toContain("run_1");
+    expect(environment.GIT_AUTHOR_NAME).toBe("gerry-please[bot]");
+    expect(environment.GIT_AUTHOR_EMAIL).toBe("gerry-please[bot]@users.noreply.github.com");
+    expect(environment.GIT_COMMITTER_NAME).toBe("gerry-please[bot]");
+    expect(environment.GIT_COMMITTER_EMAIL).toBe("gerry-please[bot]@users.noreply.github.com");
     expect(environment.GIT_CONFIG_VALUE_0).toBe("");
     expect(environment.GIT_CONFIG_VALUE_1).toContain("$GH_TOKEN");
   });

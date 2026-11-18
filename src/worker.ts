@@ -145,6 +145,7 @@ export class WorkerPool {
     let heartbeat: Timer | undefined;
     let recorder: AttemptRecorder | undefined;
     let credentialDirectory: string | undefined;
+    let ghConfigDirectory: string | undefined;
     let sessionCompatibilityHash = "";
     try {
       logger.info("run.started", { runId: run.id, attempt: run.attempt, rule: run.ruleName, agent: run.agentName });
@@ -231,6 +232,7 @@ export class WorkerPool {
         repository: run.repository,
         workspacePath: workspace.workspacePath,
       });
+      ghConfigDirectory = environment.GH_CONFIG_DIR;
       const brokerHost = ["0.0.0.0", "::", ""].includes(config.server.host) ? "127.0.0.1" : config.server.host;
       const credentialUrl = `http://${brokerHost}:${config.server.port}/agent/github/token`;
       const realGhPath = Bun.which("gh");
@@ -332,6 +334,13 @@ export class WorkerPool {
           rmSync(credentialDirectory, { recursive: true, force: true });
         } catch (error) {
           logger.warn("credential.wrapper_cleanup_failed", { runId: run.id, error: compactError(error) });
+        }
+      }
+      if (ghConfigDirectory) {
+        try {
+          rmSync(ghConfigDirectory, { recursive: true, force: true });
+        } catch (error) {
+          logger.warn("credential.gh_config_cleanup_failed", { runId: run.id, error: compactError(error) });
         }
       }
       writeRunSummary(store.dataDirectory, store.getRun(run.id));

@@ -63,7 +63,7 @@ See [docs/architecture.md](docs/architecture.md) for invariants and [docs/config
 - OpenCode V2 **2.3.0 or newer** for OpenCode agents and/or [Nous Research Hermes Agent](https://github.com/NousResearch/hermes-agent) for Hermes agents
 - A local canonical checkout of every configured repository
 
-Hermes provider/model credentials should be configured in the selected Hermes profile. OpenCode provider credentials remain in OpenCode. They are not managed by Gerry.
+Hermes provider/model credentials should be configured in the selected Hermes profile. OpenCode provider credentials remain in OpenCode. A dedicated OpenCode service receives a one-time credentials-only database snapshot, never the existing session or job state.
 
 ## Install and configure
 
@@ -236,7 +236,8 @@ See [docs/operations.md](docs/operations.md) for recovery procedures.
 - `workspace: shared` is a convention for non-coding agents, not enforced read-only access. A conversation group cannot mix shared and worktree agents. Use runtime permissions/deny rules and Hermes write restrictions as defense in depth.
 - OpenCode `ask` requests are rejected automatically. Hermes runs without `--yolo`; configure unattended/single-query approvals to `deny` and use explicit profile allowlists.
 - Only baseline environment variables and per-agent `pass_environment` entries are forwarded. Allowlisting a provider key also makes it available to agent-invoked shell commands.
-- Agents receive `GH_TOKEN`/`GITHUB_TOKEN` plus per-run `gh` and Git credential wrappers. New commands can obtain fresh tokens through the loopback credential broker while the run is active. Every token is scoped only to the event’s repository, expires automatically, and is never intentionally logged; its permissions still come from the App installation. Cross-repository dependency issues use the same kind of per-run capability with an exact repository allowlist, not broader agent credentials.
+- Local OpenCode runs use a dedicated service and database by default, not the user's shared OpenCode service. Personal `gh` and Git credential configuration is not inherited. Existing workflows keep their worktrees and branches but start fresh runtime sessions after this isolation boundary is introduced; the original OpenCode database remains intact.
+- Agents receive `GH_TOKEN`/`GITHUB_TOKEN` plus per-run `gh` and Git credential wrappers. New commands can obtain fresh tokens through the loopback credential broker while the run is active. Every token is scoped only to the event’s repository, expires automatically, and is never intentionally logged; its permissions still come from the App installation. Git commits use the explicit `gerry-please[bot]` identity, and cleanup leaves no host credential-helper fallback. Cross-repository dependency issues use the same kind of per-run capability with an exact repository allowlist, not broader agent credentials.
 - Delivery ingestion and run creation are idempotent. Incomplete dispatch is resumed on redelivery/startup without duplicating existing rules. Arbitrary agent side effects are **not exactly-once**. Inspect GitHub before retrying or resolving a failed runtime attempt.
 - A crash marks active runs `interrupted`; it never blindly resumes them. Ambiguous failures retain rule ledgers and quarantine conversations. An external runtime may still have completed work after the crash.
 - Configuration changes require restart. There is no GUI, distributed queue, automatic worktree deletion, or automatic approval interface.
