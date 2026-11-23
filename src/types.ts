@@ -98,6 +98,18 @@ export interface WorkflowRecord {
   completedAt: number | null;
 }
 
+export interface ReportPublicationRecord {
+  workflowId: string;
+  repository: string;
+  name: string;
+  rootPath: string;
+  createdByRunId: string;
+  updatedByRunId: string;
+  createdAt: number;
+  updatedAt: number;
+  unpublishedAt: number | null;
+}
+
 export type DependencyStatus = "creating" | "pending" | "resolved" | "failed" | "abandoned";
 
 export interface DependencyRecord {

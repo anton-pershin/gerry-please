@@ -64,6 +64,7 @@ function buildPrompt(input: {
   branch: string | null;
   contextPath: string;
   dependencyTargets: string[];
+  reportsEnabled: boolean;
 }): string {
   const subject = `${input.context.subject.type} #${input.context.subject.number}`;
   return `${input.instructions ? `# Agent instructions\n\n${input.instructions}\n\n` : ""}# Task\n\n${input.task}\n\n# Execution contract\n\n` +
@@ -81,7 +82,9 @@ function buildPrompt(input: {
     `Never print or persist credentials. Do not read or modify Gerry's own configuration, database, or data directory. ` +
     `Do not finish with tracked background jobs, including jobs left by earlier turns: await subagents and commands and consume their results. ` +
     `If an earlier review service is still tracked, stop it during the current turn and consume its completion report before restarting it. ` +
-    `Start persistent review services only through a foreground launcher that detaches them with nohup and redirected stdin/stdout/stderr, so no tracked job can later wake this session. ` +
+    (input.reportsEnabled
+      ? `Publish HTML reports through Gerry instead of starting standalone or nohup HTTP servers. For each distinct report directory, choose a unique lowercase hyphenated publication name and send a JSON POST to $GERRY_REPORT_PUBLISH_URL with header \`Authorization: Bearer $GERRY_AGENT_TOKEN\` and fields \`name\` and \`directory\`. The directory is relative to the assigned workspace. Finish writing all report files before publishing; later source edits are not an atomic replacement. The response contains the public report URL; use that URL in comments and preserve its relative assets. To replace an existing publication name atomically, include \`replace: true\`; otherwise choose a new name. Report URLs are unpublished automatically when the PR closes or merges. `
+      : `Start persistent review services only through a foreground launcher that detaches them with nohup and redirected stdin/stdout/stderr, so no tracked job can later wake this session. `) +
     `When writing a GitHub issue comment, PR comment, or review, append the hidden lineage marker ` +
     `\`<!-- gerry:run=${input.run.id} -->\` on its own line. ` +
     `If the task needs an operation outside your configured permissions, stop and explain what configuration change is required.` +
@@ -218,6 +221,7 @@ export class WorkerPool {
         dependencyTargets: [...new Set(config.dependencies
           .filter((dependency) => dependency.from === run.repository && dependency.allow_issue_creation)
           .map((dependency) => dependency.to))].sort(),
+        reportsEnabled: Boolean(config.reports && run.workflowId),
       });
       atomicWrite(join(runDirectory, "prompt.md"), prompt);
 
@@ -259,6 +263,13 @@ export class WorkerPool {
             url: environment.GERRY_DEPENDENCY_URL,
             capabilityConfigured: true,
           },
+        });
+      }
+      if (config.reports && run.workflowId) {
+        environment.GERRY_REPORT_PUBLISH_URL = `http://${brokerHost}:${config.server.port}/agent/reports/publish`;
+        recorder.emit({
+          type: "runtime.report_broker_environment",
+          data: { url: environment.GERRY_REPORT_PUBLISH_URL, capabilityConfigured: true },
         });
       }
       const existingRuntimeSessionId = run.runtimeSessionId ?? (run.workflowId
