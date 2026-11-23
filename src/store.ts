@@ -2,7 +2,8 @@ import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentConfig, RuleConfig, RuntimeConfig } from "./config.ts";
-import type { DependencyRecord, JsonObject, RunRecord, RunStatus, SubjectType, WebhookContext, WorkflowRecord } from "./types.ts";
+import type { PublishReportInput, PublishReportResult } from "./reports.ts";
+import type { DependencyRecord, JsonObject, ReportPublicationRecord, RunRecord, RunStatus, SubjectType, WebhookContext, WorkflowRecord } from "./types.ts";
 import { id, now } from "./util.ts";
 
 export interface DeliveryRecord {
@@ -243,6 +244,20 @@ export class Store {
       CREATE UNIQUE INDEX IF NOT EXISTS workflows_branch_idx ON workflows(branch) WHERE branch IS NOT NULL;
       CREATE INDEX IF NOT EXISTS workflows_pr_idx ON workflows(repository, pull_request_number);
 
+      CREATE TABLE IF NOT EXISTS report_publications (
+        workflow_id TEXT NOT NULL REFERENCES workflows(id),
+        repository TEXT NOT NULL,
+        name TEXT NOT NULL,
+        root_path TEXT NOT NULL,
+        created_by_run_id TEXT NOT NULL REFERENCES runs(id),
+        updated_by_run_id TEXT NOT NULL REFERENCES runs(id),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        unpublished_at INTEGER,
+        PRIMARY KEY (workflow_id, name)
+      );
+      CREATE INDEX IF NOT EXISTS report_publications_active_idx ON report_publications(workflow_id, unpublished_at);
+
       CREATE TABLE IF NOT EXISTS workflow_sessions (
         workflow_id TEXT NOT NULL REFERENCES workflows(id),
         agent_name TEXT NOT NULL,
@@ -472,6 +487,74 @@ export class Store {
   listWorkflows(limit = 50): WorkflowRecord[] {
     const rows = this.db.query("SELECT * FROM workflows ORDER BY created_at DESC LIMIT ?").all(limit) as Array<Record<string, unknown>>;
     return rows.map((row) => this.mapWorkflow(row));
+  }
+
+  private mapReportPublication(row: Record<string, unknown>): ReportPublicationRecord {
+    return {
+      workflowId: String(row.workflow_id),
+      repository: String(row.repository),
+      name: String(row.name),
+      rootPath: String(row.root_path),
+      createdByRunId: String(row.created_by_run_id),
+      updatedByRunId: String(row.updated_by_run_id),
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+      unpublishedAt: row.unpublished_at === null ? null : Number(row.unpublished_at),
+    };
+  }
+
+  getReportPublication(workflowId: string, name: string): ReportPublicationRecord | null {
+    const row = this.db.query("SELECT * FROM report_publications WHERE workflow_id = ? AND name = ?").get(workflowId, name) as Record<string, unknown> | null;
+    return row ? this.mapReportPublication(row) : null;
+  }
+
+  getActiveReportPublication(workflowId: string, name: string): ReportPublicationRecord | null {
+    const row = this.db.query("SELECT * FROM report_publications WHERE workflow_id = ? AND name = ? AND unpublished_at IS NULL").get(workflowId, name) as Record<string, unknown> | null;
+    return row ? this.mapReportPublication(row) : null;
+  }
+
+  listReportPublications(workflowId?: string): ReportPublicationRecord[] {
+    const rows = workflowId
+      ? this.db.query("SELECT * FROM report_publications WHERE workflow_id = ? ORDER BY name").all(workflowId) as Array<Record<string, unknown>>
+      : this.db.query("SELECT * FROM report_publications ORDER BY workflow_id, name").all() as Array<Record<string, unknown>>;
+    return rows.map((row) => this.mapReportPublication(row));
+  }
+
+  publishReport(input: PublishReportInput): PublishReportResult {
+    return this.db.transaction((): PublishReportResult => {
+      const workflow = this.getWorkflow(input.workflowId);
+      const run = this.getRun(input.runId);
+      if (!["active", "waiting"].includes(workflow.status) || run.workflowId !== input.workflowId || run.repository !== input.repository || !["preparing", "running"].includes(run.status)) {
+        return { status: "unavailable" };
+      }
+      const existing = this.getReportPublication(input.workflowId, input.name);
+      if (existing) {
+        if (existing.unpublishedAt === null && existing.rootPath === input.rootPath && existing.updatedByRunId === input.runId) {
+          return { status: "unchanged", publication: existing };
+        }
+        if (!input.replace) return { status: "conflict", publication: existing };
+        this.db.query(`UPDATE report_publications
+          SET repository = ?, root_path = ?, updated_by_run_id = ?, updated_at = ?, unpublished_at = NULL
+          WHERE workflow_id = ? AND name = ?`)
+          .run(input.repository, input.rootPath, input.runId, input.now, input.workflowId, input.name);
+        return { status: "replaced", publication: this.getReportPublication(input.workflowId, input.name)! };
+      }
+      this.db.query(`INSERT INTO report_publications
+        (workflow_id, repository, name, root_path, created_by_run_id, updated_by_run_id, created_at, updated_at, unpublished_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`)
+        .run(input.workflowId, input.repository, input.name, input.rootPath, input.runId, input.runId, input.now, input.now);
+      return { status: "created", publication: this.getReportPublication(input.workflowId, input.name)! };
+    })();
+  }
+
+  unpublishReport(workflowId: string, name: string, timestamp = now()): boolean {
+    return this.db.query("UPDATE report_publications SET unpublished_at = ?, updated_at = ? WHERE workflow_id = ? AND name = ? AND unpublished_at IS NULL")
+      .run(timestamp, timestamp, workflowId, name).changes === 1;
+  }
+
+  unpublishReportsForWorkflow(workflowId: string, timestamp = now()): number {
+    return this.db.query("UPDATE report_publications SET unpublished_at = ?, updated_at = ? WHERE workflow_id = ? AND unpublished_at IS NULL")
+      .run(timestamp, timestamp, workflowId).changes;
   }
 
   private findWorkflowByOrigin(type: string, repository: string, issueNumber: number): WorkflowRecord | null {
@@ -1152,32 +1235,35 @@ export class Store {
   }
 
   linkWorkflowPullRequest(context: WebhookContext): WorkflowRecord | null {
-    const pullRequest = context.payload.pull_request as Record<string, unknown> | undefined;
-    if (!pullRequest) return null;
-    const head = pullRequest.head as Record<string, unknown> | undefined;
-    const branch = typeof head?.ref === "string" ? head.ref : null;
-    if (!branch) return null;
-    const row = this.db.query("SELECT id FROM workflows WHERE branch = ? AND repository = ?").get(branch, context.repository) as { id: string } | null;
-    if (!row) return null;
-    if (!this.pullRequestMatchesWorkflow(context, this.getWorkflow(row.id))) return null;
-    const number = Number(pullRequest.number ?? context.subject.number);
-    const url = typeof pullRequest.html_url === "string" ? pullRequest.html_url : null;
-    this.db.query("UPDATE workflows SET pull_request_number = ?, pull_request_url = ?, updated_at = ? WHERE id = ?")
-      .run(number, url, now(), row.id);
-    if (context.event === "pull_request" && context.action === "closed") {
-      const timestamp = now();
-      if (pullRequest.merged === true) {
-        this.db.query("UPDATE workflows SET status = 'completed', completed_at = ?, updated_at = ? WHERE id = ? AND status IN ('active', 'waiting')")
-          .run(timestamp, timestamp, row.id);
-      } else {
-        this.db.query("UPDATE workflows SET status = 'closed', completed_at = NULL, updated_at = ? WHERE id = ? AND status IN ('active', 'waiting')")
-          .run(timestamp, row.id);
+    return this.db.transaction((): WorkflowRecord | null => {
+      const pullRequest = context.payload.pull_request as Record<string, unknown> | undefined;
+      if (!pullRequest) return null;
+      const head = pullRequest.head as Record<string, unknown> | undefined;
+      const branch = typeof head?.ref === "string" ? head.ref : null;
+      if (!branch) return null;
+      const row = this.db.query("SELECT id FROM workflows WHERE branch = ? AND repository = ?").get(branch, context.repository) as { id: string } | null;
+      if (!row) return null;
+      if (!this.pullRequestMatchesWorkflow(context, this.getWorkflow(row.id))) return null;
+      const number = Number(pullRequest.number ?? context.subject.number);
+      const url = typeof pullRequest.html_url === "string" ? pullRequest.html_url : null;
+      this.db.query("UPDATE workflows SET pull_request_number = ?, pull_request_url = ?, updated_at = ? WHERE id = ?")
+        .run(number, url, now(), row.id);
+      if (context.event === "pull_request" && context.action === "closed") {
+        const timestamp = now();
+        if (pullRequest.merged === true) {
+          this.db.query("UPDATE workflows SET status = 'completed', completed_at = ?, updated_at = ? WHERE id = ? AND status IN ('active', 'waiting')")
+            .run(timestamp, timestamp, row.id);
+        } else {
+          this.db.query("UPDATE workflows SET status = 'closed', completed_at = NULL, updated_at = ? WHERE id = ? AND status IN ('active', 'waiting')")
+            .run(timestamp, row.id);
+        }
+        this.unpublishReportsForWorkflow(row.id, timestamp);
+      } else if (context.event === "pull_request" && context.action === "reopened") {
+        this.db.query("UPDATE workflows SET status = 'active', updated_at = ? WHERE id = ? AND status = 'closed'")
+          .run(now(), row.id);
       }
-    } else if (context.event === "pull_request" && context.action === "reopened") {
-      this.db.query("UPDATE workflows SET status = 'active', updated_at = ? WHERE id = ? AND status = 'closed'")
-        .run(now(), row.id);
-    }
-    return this.getWorkflow(row.id);
+      return this.getWorkflow(row.id);
+    })();
   }
 
   private mapDependency(row: Record<string, unknown>): DependencyRecord {

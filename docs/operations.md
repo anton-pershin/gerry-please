@@ -5,6 +5,8 @@
 ```sh
 bun run src/cli.ts status
 bun run src/cli.ts workflows list
+bun run src/cli.ts reports list
+bun run src/cli.ts reports list --workflow wf_...
 bun run src/cli.ts dependencies list
 bun run src/cli.ts runs list --limit 50
 bun run src/cli.ts runs list --status failed
@@ -61,7 +63,28 @@ To restart the dedicated service, stop only its registered process and then star
 
 Run `bun run test/opencode-service-smoke.ts` to verify isolated startup, blocked personal `gh` fallback, bot Git identity, and preservation of the normal service. Optional `OPENCODE_SMOKE_PROVIDER` plus `OPENCODE_SMOKE_MODEL` checks a minimal provider call, `OPENCODE_SMOKE_AGENTS` checks a comma-separated list of custom agents, and `OPENCODE_SMOKE_OLD_SESSION` verifies that an old session is absent from the isolated database. The script creates and stops only its own disposable service.
 
-Activity-aware completion waits for every tracked background job, including jobs left by older runs. If an existing session has a persistent report server registered as an OpenCode background shell, stop that process during an active agent turn and let the parent consume its completion report. Then restart the service through a foreground launcher that uses `nohup` with stdin/stdout/stderr redirected. There is no detach operation: `shell.remove` is not a safe way to detach a harness-managed background process and may not cover its job record. Verify that the jobs API no longer lists the old process. A detached service has no tracked completion report that can resume the parent after Gerry cleans run credentials.
+Activity-aware completion waits for every tracked background job, including jobs left by older runs. If an existing session has a legacy persistent server registered as an OpenCode background shell, stop that process during an active agent turn and let the parent consume its completion report. There is no safe `shell.remove` detach operation. Verify that the jobs API no longer lists the old process. A detached service has no tracked completion report that can resume the parent after Gerry cleans run credentials.
+
+## Managed report hosting
+
+When the `reports` configuration section is present, Gerry starts one static listener on the configured address (port `8123` in the example). Both HTTP listeners must bind successfully before workers start; a bind failure closes the other listener, SQLite, and the instance lock. Stop any legacy process on the report port before starting Gerry. Existing manually detached servers are not adopted or killed automatically.
+
+Workflow agents receive `GERRY_REPORT_PUBLISH_URL` and publish through the private main listener, for example:
+
+```sh
+curl --fail-with-body -X POST "$GERRY_REPORT_PUBLISH_URL" \
+  -H "Authorization: Bearer $GERRY_AGENT_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"name":"bpe","directory":"outputs/pr14-bpe"}'
+```
+
+The response contains the public URL prefix. Publish each distinct report directory under a different lowercase hyphenated name. Repeating the same request from one run is idempotent. To replace a publication atomically, use the same name with `"replace": true`; failed validation leaves the previous mapping intact. Only `GET` and `HEAD` are available on the static listener, and no directory listing is provided.
+
+Publication mappings survive Gerry restarts, but the static listener is available only while Gerry is running. Merged and closed-unmerged PR events unpublish every name for the matching workflow in the same transaction as the lifecycle change. Duplicate close events are no-ops. Reopening does not restore old URLs; an active run must explicitly republish with `replace: true`. Publication after terminal workflow state is rejected.
+
+Use `reports list [--workflow wf_...]` to inspect active and historical mappings. Use `reports unpublish wf_... <name>` for an idempotent manual cleanup. Unpublishing never deletes report files, worktrees, branches, sessions, or run artifacts. Because files are served directly from their registered worktree directories, removing or changing those directories later can make active URLs unavailable; preserve them for as long as the reports are needed.
+
+The report origin can expose sensitive generated content. Restrict its network reach and proxy only `/reports/` if needed. The `/agent/` publication endpoint remains private and must never be proxied publicly.
 
 ## Configuration errors
 
@@ -134,6 +157,7 @@ Define retention based on issue/PR sensitivity and token/tool output exposure. R
 - Use a dedicated least-privilege OS user and protect the data directory.
 - Install the GitHub App only on intended repositories with only required permissions.
 - Use TLS at the reverse proxy and retain the default loopback bind. Expose `/webhooks/github` and optionally `/health`, but never proxy `/agent/` endpoints; their per-run capabilities are intended only for local agents.
+- If managed reports are enabled, keep the static listener on a separate origin and restrict access to generated content. Expose only `/reports/` through its proxy, and ensure the configured `public_base_url` matches that public origin.
 - Keep runtime provider credentials in runtime-managed profiles/configuration.
 - Set Hermes unattended/single-query approvals to deny; avoid `--yolo` and broad shell access.
 - Consider runtime container backends for untrusted repositories or issues. Worktrees alone do not contain prompt-injection-driven host commands.

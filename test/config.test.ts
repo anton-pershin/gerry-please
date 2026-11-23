@@ -33,6 +33,25 @@ describe("configuration", () => {
     expect(config.runtimes.opencode).toMatchObject({ type: "opencode", dedicated_service: true });
   });
 
+  test("configures managed report hosting without changing the default configuration", () => {
+    const fixture = configFixture();
+    directories.push(fixture.directory);
+    expect(fixture.config.reports).toBeUndefined();
+    const path = join(fixture.directory, "gerry.yaml");
+    const raw = parse(readFileSync(path, "utf8")) as any;
+    raw.reports = { public_base_url: "http://xxx.xxx.xxx.xxx:8123" };
+    writeFileSync(path, stringify(raw));
+    const config = loadConfig(path);
+    expect(config.reports).toEqual({
+      host: "0.0.0.0",
+      port: 8123,
+      public_base_url: "http://xxx.xxx.xxx.xxx:8123",
+    });
+    raw.reports.public_base_url = "https://example.com/reports";
+    writeFileSync(path, stringify(raw));
+    expect(() => loadConfig(path)).toThrow("public_base_url");
+  });
+
   test("rejects duplicate rules and unknown agents", () => {
     const fixture = configFixture();
     directories.push(fixture.directory);

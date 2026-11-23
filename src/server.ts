@@ -7,6 +7,7 @@ import { readPrompt, resolveConfigPath } from "./config.ts";
 import { verifyWebhookSignature, type GitHubSecrets } from "./github.ts";
 import { Logger, atomicWrite } from "./observability.ts";
 import { buildContext, parentRunFromPayload, ruleMatches } from "./rules.ts";
+import type { ReportService } from "./reports.ts";
 import type { Store } from "./store.ts";
 import type { JsonObject } from "./types.ts";
 import { compactError } from "./util.ts";
@@ -194,6 +195,7 @@ export function createFetchHandler(input: {
   webhook: WebhookHandler;
   dependencies?: DependencyService;
   credentials?: AgentCredentialService;
+  reports?: ReportService;
 }): (request: Request) => Promise<Response> {
   return async (request: Request): Promise<Response> => {
     const url = new URL(request.url);
@@ -203,6 +205,9 @@ export function createFetchHandler(input: {
     if (url.pathname === "/webhooks/github") return input.webhook.handle(request);
     if (url.pathname === "/agent/github/token" && input.credentials) {
       return input.credentials.handleAgentRequest(request);
+    }
+    if (url.pathname === "/agent/reports/publish" && input.reports) {
+      return input.reports.handleAgentRequest(request);
     }
     if (url.pathname === "/agent/dependencies" && input.dependencies) {
       return input.dependencies.handleAgentRequest(request);

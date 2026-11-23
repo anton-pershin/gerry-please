@@ -12,6 +12,25 @@ Copy `gerry.example.yaml` to `gerry.yaml`. Unknown fields are validation errors.
 | `workers` | `2` | Maximum concurrent runs, 1–32 |
 | `max_body_bytes` | `10485760` | Maximum webhook request size |
 
+## `reports`
+
+The optional `reports` section enables one Gerry-owned static HTTP listener for all agent-generated reports:
+
+```yaml
+reports:
+  host: 0.0.0.0
+  port: 8123
+  public_base_url: http://xxx.xxx.xxx.xxx:8123
+```
+
+`host` defaults to `0.0.0.0` and `port` defaults to `8123`. `public_base_url` is required and must be an HTTP(S) origin without credentials, a path, query, or fragment. It is the origin agents return in their report links; use a masked-IP placeholder only when that is also the convention for the resulting comments. The report listener is separate from the private webhook/agent-broker listener. If `reports` is absent, no listener or report-publishing instructions are added.
+
+Each workflow run can publish multiple named report directories through the capability-checked `POST /agent/reports/publish` endpoint on the main loopback broker. The JSON body contains `name` (a lowercase hyphenated slug), `directory` (a strict subdirectory of the assigned workspace), and optionally `replace: true`. Each `(workflow ID, name)` maps to its own report root. The response returns a URL of the form `<public_base_url>/reports/<workflow-id>/<name>/`; nested files and relative assets remain beneath that prefix. Finish all writes before publishing because the mapping points at the live directory rather than an immutable snapshot. Repeating the same publication from the same run and directory is idempotent. Replacing an existing name requires `replace: true` and updates the mapping atomically.
+
+Only active workflow runs can publish. Publication roots and requested files are resolved with symlink/containment checks, `.git` cannot be published, and the static listener supports only `GET` and `HEAD`, with no directory listings. Closing or merging a PR atomically unpublishes every report associated with its workflow. Reopening does not restore old mappings; an active run must explicitly republish with `replace: true`. Unpublishing never deletes the underlying report files, worktree, branch, or runtime session.
+
+The static origin serves generated, potentially sensitive content. Restrict network access appropriately, and expose only `/reports/` if a reverse proxy is used. Never expose `/agent/` endpoints through the report listener or a public proxy.
+
 ## `github`
 
 The App credential values come from the environment, not YAML:
@@ -55,7 +74,7 @@ With `dedicated_service: true`, Gerry starts or reuses its own OpenCode service 
 
 On first startup, an existing OpenCode database can supply a one-time snapshot of provider credential tables so model access continues to work. Sessions, messages, jobs, inboxes, automation, and event history are removed from the copy; the original database is never modified. The new service therefore has no existing session it can resume. Enabling the dedicated service changes the runtime compatibility identity, so existing workflows deliberately start fresh runtime sessions while retaining their worktrees, branches, and GitHub discussions. `dedicated_service: false` is a legacy escape hatch that reuses the user's shared service and does not provide this isolation.
 
-An explicit `base_url` bypasses local service management. The external server must provide equivalent protection against fallback to personal `gh` and Git credentials. OpenCode **2.3.0 or newer** is required in all modes. Gerry checks this during local service discovery, integration checks, and every run before prompt admission. A run does not complete merely because its parent session is idle: Gerry waits for all descendant subagents, every tracked shell job, and their completion reports. It also revalidates the complete descendant tree on both sides of the check, requiring unchanged membership and server-authoritative durable log watermarks, no active execution anywhere in the tree, and empty jobs/inbox so a consumed report, active child, or newly created job cannot slip through a stale snapshot and wake a session after credential cleanup. Persistent services such as report servers must be launched by a foreground command that detaches them with `nohup` and redirected stdin/stdout/stderr; do not leave them as tracked OpenCode background jobs.
+An explicit `base_url` bypasses local service management. The external server must provide equivalent protection against fallback to personal `gh` and Git credentials. OpenCode **2.3.0 or newer** is required in all modes. Gerry checks this during local service discovery, integration checks, and every run before prompt admission. A run does not complete merely because its parent session is idle: Gerry waits for all descendant subagents, every tracked shell job, and their completion reports. It also revalidates the complete descendant tree on both sides of the check, requiring unchanged membership and server-authoritative durable log watermarks, no active execution anywhere in the tree, and empty jobs/inbox so a consumed report, active child, or newly created job cannot slip through a stale snapshot and wake a session after credential cleanup. Do not leave tracked OpenCode background jobs. When managed report hosting is enabled, agents publish reports through Gerry and must not start standalone or `nohup` report servers. Any other persistent service must be launched by a foreground command that detaches it with `nohup` and redirected stdin/stdout/stderr.
 
 ### Hermes
 

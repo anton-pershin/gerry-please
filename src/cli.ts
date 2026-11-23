@@ -7,6 +7,8 @@ import { GitHubAppTokens, loadGitHubSecrets } from "./github.ts";
 import { InstanceLock } from "./instance-lock.ts";
 import { Logger, writeRunSummary } from "./observability.ts";
 import { AgentCredentialService } from "./credentials.ts";
+import { createReportFetchHandler } from "./report-host.ts";
+import { ReportService } from "./reports.ts";
 import { createRuntimes } from "./runtimes/index.ts";
 import { hermesArguments } from "./runtimes/hermes.ts";
 import { validateOpenCodeOptions } from "./runtimes/opencode.ts";
@@ -29,6 +31,10 @@ Commands:
   workflows list              List workflow instances and their current state
   workflows show ID           Show a workflow and its dependencies
   workflows abandon ID        Archive a closed-unmerged workflow and release its ledger
+  reports list [--workflow ID]
+                                List active and historical report publications
+  reports unpublish WORKFLOW_ID NAME
+                                Disable one report URL without deleting its files
   dependencies list           List cross-repository dependency requests
   dependencies attach ID --issue-number N
                                 Attach a verified issue after ambiguous creation
@@ -133,24 +139,45 @@ async function serve(config: LoadedConfig, skipChecks: boolean): Promise<void> {
   }
   const dependencies = new DependencyService(config, store, tokens, logger);
   const credentials = new AgentCredentialService(store, tokens, logger);
+  const reports = config.reports ? new ReportService(store, config.reports.public_base_url, logger) : undefined;
   const workers = new WorkerPool({ config, store, runtimes, tokens, logger, runGate: dependencies });
   const webhook = new WebhookHandler(config, store, secrets, logger, dependencies);
   await webhook.recover();
-  const server = Bun.serve({
-    hostname: config.server.host,
-    port: config.server.port,
-    fetch: createFetchHandler({ config, store, webhook, dependencies, credentials }),
-  });
+  let server: ReturnType<typeof Bun.serve> | undefined;
+  let reportServer: ReturnType<typeof Bun.serve> | undefined;
+  try {
+    server = Bun.serve({
+      hostname: config.server.host,
+      port: config.server.port,
+      fetch: createFetchHandler({ config, store, webhook, dependencies, credentials, ...(reports ? { reports } : {}) }),
+    });
+    reportServer = config.reports ? Bun.serve({
+      hostname: config.reports.host,
+      port: config.reports.port,
+      fetch: createReportFetchHandler(store),
+    }) : undefined;
+  } catch (error) {
+    reportServer?.stop(true);
+    server?.stop(true);
+    store.close();
+    instanceLock.release();
+    throw error;
+  }
   workers.start();
   const dependencyRecovery = setInterval(() => {
     void dependencies.recover().catch((error) => logger.warn("dependency.recovery_failed", { error: compactError(error) }));
   }, 60_000);
   logger.info("server.started", { host: config.server.host, port: server.port, workers: config.server.workers });
   console.log(`Webhook endpoint: http://${config.server.host}:${server.port}/webhooks/github`);
+  if (reportServer && config.reports) {
+    logger.info("report.server_started", { host: config.reports.host, port: reportServer.port });
+    console.log(`Report endpoint: ${config.reports.public_base_url}/reports/`);
+  }
 
   const shutdown = async (): Promise<void> => {
     logger.info("server.stopping");
     clearInterval(dependencyRecovery);
+    reportServer?.stop(true);
     server.stop(true);
     await workers.stop();
     store.close();
@@ -200,6 +227,16 @@ async function main(): Promise<void> {
         const workflowId = args[args.indexOf("workflows") + 2];
         if (!workflowId) throw new Error("Workflow ID is required");
         return console.log(JSON.stringify(store.abandonWorkflow(workflowId), null, 2));
+      }
+    }
+    if (command === "reports") {
+      const subcommand = args[args.indexOf("reports") + 1];
+      if (subcommand === "list") return console.log(JSON.stringify(store.listReportPublications(option(args, "--workflow")), null, 2));
+      if (subcommand === "unpublish") {
+        const workflowId = args[args.indexOf("reports") + 2];
+        const name = args[args.indexOf("reports") + 3];
+        if (!workflowId || !name) throw new Error("Workflow ID and publication name are required");
+        return console.log(JSON.stringify({ workflowId, name, unpublished: store.unpublishReport(workflowId, name) }, null, 2));
       }
     }
     if (command === "dependencies") {

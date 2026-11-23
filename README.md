@@ -13,6 +13,7 @@ There is no GUI. YAML configures the system, SQLite makes execution durable, and
 - Runs independent implementation workflows in parallel while serializing turns within each workflow and applying per-workflow turn budgets.
 - Links PRs to workflows by head branch, keeps them active after approval, and completes them when the PR merges.
 - Supports allowlisted cross-repository dependencies: an implementer can request an issue in another repository, wait, and resume after that issue closes through its linked PR merge.
+- Optionally hosts multiple named static reports per workflow from one managed listener and automatically unpublishes them when the PR closes or merges.
 - Serializes each discussion and applies a shared turn budget across participating agents to stop comment loops.
 - Gives coding agents dedicated Git worktrees and branches; preserves them after failure for inspection.
 - Uses short-lived GitHub App installation tokens for `gh` and Git operations.
@@ -175,6 +176,8 @@ Mentions and filters are configuration conventions, not a natural-language route
 bun run src/cli.ts status
 bun run src/cli.ts workflows list
 bun run src/cli.ts workflows show wf_...
+bun run src/cli.ts reports list
+bun run src/cli.ts reports list --workflow wf_...
 bun run src/cli.ts dependencies list
 bun run src/cli.ts runs list
 bun run src/cli.ts runs list --status failed --limit 20
@@ -195,6 +198,9 @@ bun run src/cli.ts runs resolve run_...
 # Archive a closed-unmerged workflow and allow a fresh implementation on reapproval
 bun run src/cli.ts workflows abandon wf_...
 
+# Disable one hosted report without deleting its files (idempotent)
+bun run src/cli.ts reports unpublish wf_... bpe
+
 # Why a delivery did or did not dispatch
 bun run src/cli.ts deliveries show DELIVERY_UUID
 ```
@@ -207,7 +213,7 @@ The default data directory is `.gerry/`:
 
 ```text
 .gerry/
-├── gerry.sqlite                 # runs, workflows, sessions, dependencies, leases, turn budgets
+├── gerry.sqlite                 # runs, workflows, sessions, dependencies, report publications, leases, turn budgets
 ├── serve.lock                   # live single-instance daemon lock (when serving)
 ├── logs/
 │   └── service.jsonl            # ingress, dispatch, worker, and lifecycle events
@@ -237,6 +243,7 @@ See [docs/operations.md](docs/operations.md) for recovery procedures.
 - OpenCode `ask` requests are rejected automatically. Hermes runs without `--yolo`; configure unattended/single-query approvals to `deny` and use explicit profile allowlists.
 - Only baseline environment variables and per-agent `pass_environment` entries are forwarded. Allowlisting a provider key also makes it available to agent-invoked shell commands.
 - Local OpenCode runs use a dedicated service and database by default, not the user's shared OpenCode service. Personal `gh` and Git credential configuration is not inherited. Existing workflows keep their worktrees and branches but start fresh runtime sessions after this isolation boundary is introduced; the original OpenCode database remains intact.
+- Managed report hosting uses a separate static origin for potentially sensitive generated HTML. Restrict its network access and expose only `/reports/`; capability-checked `/agent/` publication and credential brokers must remain private.
 - Agents receive `GH_TOKEN`/`GITHUB_TOKEN` plus per-run `gh` and Git credential wrappers. New commands can obtain fresh tokens through the loopback credential broker while the run is active. Every token is scoped only to the event’s repository, expires automatically, and is never intentionally logged; its permissions still come from the App installation. Git commits use the explicit `gerry-please[bot]` identity, and cleanup leaves no host credential-helper fallback. Cross-repository dependency issues use the same kind of per-run capability with an exact repository allowlist, not broader agent credentials.
 - Delivery ingestion and run creation are idempotent. Incomplete dispatch is resumed on redelivery/startup without duplicating existing rules. Arbitrary agent side effects are **not exactly-once**. Inspect GitHub before retrying or resolving a failed runtime attempt.
 - A crash marks active runs `interrupted`; it never blindly resumes them. Ambiguous failures retain rule ledgers and quarantine conversations. An external runtime may still have completed work after the crash.

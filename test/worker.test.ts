@@ -8,6 +8,7 @@ import { Store } from "../src/store.ts";
 import type { AgentRuntime, RuntimeRunInput } from "../src/types.ts";
 import { WorkerPool } from "../src/worker.ts";
 import { configFixture, context } from "./helpers.ts";
+import { enqueueWorkflow, initializeOrigin, issueContext, workflowConfigFixture } from "./workflow-helpers.ts";
 
 const directories: string[] = [];
 afterEach(() => {
@@ -202,6 +203,36 @@ describe("worker execution", () => {
     expect(fixture.runtime.inputs[1]!.existingSessionId).toBe("early-session-1");
     expect(fixture.store.getRun(decision.runId!).status).toBe("succeeded");
     fixture.store.close();
+  });
+
+  test("injects managed report publishing into workflow runs when enabled", async () => {
+    const fixture = workflowConfigFixture();
+    directories.push(fixture.directory);
+    initializeOrigin(fixture.directory);
+    fixture.config.reports = { host: "0.0.0.0", port: 8123, public_base_url: "http://xxx.xxx.xxx.xxx:8123" };
+    const store = new Store(fixture.config.dataDir);
+    const runtime = new FakeRuntime(async () => ({ sessionId: "report-session", response: "done" }));
+    const logger = new Logger(join(fixture.config.dataDir, "service.jsonl"), undefined, false);
+    const workers = new WorkerPool({
+      config: fixture.config,
+      store,
+      runtimes: new Map([["hermes", runtime]]),
+      tokens: { get: async () => "secret-installation-token" },
+      logger,
+    });
+    enqueueWorkflow(store, fixture, issueContext(), "implement-approved-issue");
+    expect(await workers.runNext("worker-test")).toBe(true);
+    const input = runtime.inputs[0]!;
+    expect(input.environment.GERRY_REPORT_PUBLISH_URL).toBe("http://127.0.0.1:3789/agent/reports/publish");
+    expect(input.prompt).toContain("Publish HTML reports through Gerry");
+    expect(input.prompt).toContain("instead of starting standalone or nohup HTTP servers");
+    expect(input.prompt).toContain("replace: true");
+    expect(input.prompt).toContain("Finish writing all report files before publishing");
+    expect(input.prompt).toContain("unpublished automatically when the PR closes or merges");
+    const run = store.listRuns(1)[0]!;
+    const events = readFileSync(join(fixture.config.dataDir, "runs", run.id, "attempts", "1", "events.jsonl"), "utf8");
+    expect(events).toContain("runtime.report_broker_environment");
+    store.close();
   });
 
   test("automatically retries failures before runtime startup", async () => {

@@ -71,6 +71,24 @@ const configSchema = z
       })
       .strict()
       .default({ host: "127.0.0.1", port: 3789, data_dir: ".gerry", workers: 2, max_body_bytes: 10 * 1024 * 1024 }),
+    reports: z
+      .object({
+        host: z.string().min(1).default("0.0.0.0"),
+        port: z.number().int().min(1).max(65535).default(8123),
+        public_base_url: z.url(),
+      })
+      .strict()
+      .superRefine((reports, context) => {
+        const url = new URL(reports.public_base_url);
+        if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash || url.pathname !== "/") {
+          context.addIssue({
+            code: "custom",
+            message: "public_base_url must be an HTTP(S) origin without credentials, a path, query, or fragment",
+            path: ["public_base_url"],
+          });
+        }
+      })
+      .optional(),
     github: z
       .object({
         app_id_env: z.string().min(1).default("GITHUB_APP_ID"),
